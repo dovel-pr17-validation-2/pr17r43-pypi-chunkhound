@@ -1,0 +1,890 @@
+"""Tests for Claude Code CLI LLM provider."""
+
+import asyncio
+import json
+import os
+import tempfile
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from chunkhound.core.config.claude_model_resolution import (
+    CLAUDE_HAIKU_SENTINEL,
+    CLAUDE_OPUS_SENTINEL,
+    CLAUDE_SONNET_SENTINEL,
+)
+from chunkhound.core.config.llm_config import DEFAULT_LLM_TIMEOUT
+from chunkhound.interfaces.llm_provider import LLMResponse, OutputLimitCapability
+from chunkhound.providers.llm.claude_code_cli_provider import ClaudeCodeCLIProvider
+
+
+@pytest.fixture
+def provider():
+    """Create a ClaudeCodeCLIProvider instance for testing."""
+    return ClaudeCodeCLIProvider(
+        model="claude-sonnet-4-5-20250929",
+        timeout=60,
+        max_retries=3,
+    )
+
+
+@pytest.fixture
+def mock_subprocess():
+    """Mock subprocess calls to avoid calling actual CLI."""
+    # Resolve bare "claude" to a fake .exe so argv stays multi-token (not cmd /c).
+    with (
+        patch("asyncio.create_subprocess_exec") as mock,
+        patch(
+            "chunkhound.providers.llm.claude_code_cli_provider.resolve_cli_binary",
+            return_value=(
+                r"C:\fake\claude.exe"
+                if __import__("sys").platform == "win32"
+                else "/fake/claude"
+            ),
+        ),
+    ):
+        yield mock
+
+
+class TestClaudeCodeCLIProvider:
+    """Test suite for ClaudeCodeCLIProvider."""
+
+    def test_provider_name(self, provider):
+        """Test that provider name is correct."""
+        assert provider.name == "claude-code-cli"
+
+    def test_output_cap_omission_capability_is_unknown(self, provider):
+        """Claude CLI exposes no authoritative output-cap omission contract."""
+        assert provider.output_limit_metadata.omission is OutputLimitCapability.UNKNOWN
+
+    def test_provider_model(self, provider):
+        """Test that model name is stored correctly."""
+        assert provider.model == "claude-sonnet-4-5-20250929"
+
+    def test_default_model_is_haiku(self, monkeypatch):
+        """Test that Claude CLI defaults to the shared Haiku sentinel."""
+        monkeypatch.delenv("CHUNKHOUND_CLAUDE_DEFAULT_HAIKU_MODEL", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        provider = ClaudeCodeCLIProvider()
+        assert provider.model == CLAUDE_HAIKU_SENTINEL
+
+    def test_default_model_stores_sentinel_when_no_chunkhound_override(
+        self, monkeypatch
+    ):
+        """Without a ChunkHound override, the CLI sentinel stays unresolved."""
+        monkeypatch.delenv("CHUNKHOUND_CLAUDE_DEFAULT_HAIKU_MODEL", raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        monkeypatch.setattr(
+            "chunkhound.core.config.claude_model_resolution."
+            "get_latest_available_haiku_model",
+            lambda api_key=None: pytest.fail("discovery should not run"),
+        )
+
+        provider = ClaudeCodeCLIProvider()
+        assert provider.model == CLAUDE_HAIKU_SENTINEL
+
+    def test_chunkhound_env_override_resolves_before_cli(self, monkeypatch):
+        """ChunkHound Claude overrides still pin the CLI model."""
+        monkeypatch.setenv(
+            "CHUNKHOUND_CLAUDE_DEFAULT_SONNET_MODEL",
+            "claude-sonnet-4-6-20260217",
+        )
+
+        provider = ClaudeCodeCLIProvider(model=CLAUDE_SONNET_SENTINEL)
+
+        assert provider.model == "claude-sonnet-4-6-20260217"
+
+    @pytest.mark.asyncio
+    async def test_complete_uses_cli_alias_for_sentinel(
+        self, mock_subprocess
+    ):
+        """Sentinels reach the subprocess as bare Claude CLI aliases."""
+        provider = ClaudeCodeCLIProvider(model=CLAUDE_SONNET_SENTINEL)
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (b"Test response", b"")
+        mock_subprocess.return_value = mock_process
+
+        await provider.complete("Test prompt")
+
+        cmd = mock_subprocess.call_args.args
+        assert cmd[cmd.index("--model") + 1] == "sonnet"
+
+    @pytest.mark.asyncio
+    async def test_complete_uses_chunkhound_env_override_model(
+        self, mock_subprocess, monkeypatch
+    ):
+        """ChunkHound Claude overrides must reach the CLI unchanged."""
+        monkeypatch.setenv(
+            "CHUNKHOUND_CLAUDE_DEFAULT_OPUS_MODEL",
+            "claude-opus-4-7-20260416",
+        )
+        provider = ClaudeCodeCLIProvider(model=CLAUDE_OPUS_SENTINEL)
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (b"Test response", b"")
+        mock_subprocess.return_value = mock_process
+
+        await provider.complete("Test prompt")
+
+        cmd = mock_subprocess.call_args.args
+        assert cmd[cmd.index("--model") + 1] == "claude-opus-4-7-20260416"
+
+    @pytest.mark.asyncio
+    async def test_complete_uses_explicit_full_model_name(
+        self, mock_subprocess
+    ):
+        """Explicit Claude model names must reach the CLI unchanged."""
+        provider = ClaudeCodeCLIProvider(model="claude-sonnet-4-5-20250929")
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (b"Test response", b"")
+        mock_subprocess.return_value = mock_process
+
+        await provider.complete("Test prompt")
+
+        cmd = mock_subprocess.call_args.args
+        assert cmd[cmd.index("--model") + 1] == "claude-sonnet-4-5-20250929"
+
+    @pytest.mark.asyncio
+    async def test_complete_passes_mcp_config_as_temp_file_path(
+        self, provider, mock_subprocess
+    ):
+        """Inline JSON is not used; path to empty mcpServers file is passed."""
+        from pathlib import Path
+
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (b"ok", b"")
+        mock_subprocess.return_value = mock_process
+
+        await provider.complete("Test prompt")
+
+        cmd = mock_subprocess.call_args.args
+        # argv may be multi-token (.exe) or a single /c string (.cmd wrap)
+        blob = " ".join(str(a) for a in cmd)
+        assert "--mcp-config" in blob
+        assert "mcpServers" not in blob  # no inline JSON payload
+        assert '{"mcpServers":{}}' not in blob
+
+        # Resolve config path from multi-token argv when possible
+        if "--mcp-config" in cmd:
+            cfg = Path(cmd[cmd.index("--mcp-config") + 1])
+            assert cfg.suffix == ".json"
+            assert "chunkhound_claude_mcp_" in cfg.name
+            # File is removed after the call
+            assert not cfg.exists()
+        else:
+            # Windows cmd /c: path appears in the joined command string
+            assert "chunkhound_claude_mcp_" in blob
+            assert ".json" in blob
+
+    @pytest.mark.asyncio
+    async def test_complete_disables_user_hooks(self, provider, mock_subprocess):
+        """User hooks (e.g. a Stop hook) cannot replace the answer the caller gets."""
+        from pathlib import Path
+
+        captured: dict[str, object] = {}
+
+        async def read_settings(input=None):
+            cmd = mock_subprocess.call_args.args
+            path = Path(cmd[cmd.index("--settings") + 1])
+            captured["path"] = path
+            captured["settings"] = json.loads(path.read_text(encoding="utf-8"))
+            return (b"ok", b"")
+
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate = read_settings
+        mock_subprocess.return_value = mock_process
+
+        await provider.complete("Test prompt")
+
+        assert captured["settings"] == {"disableAllHooks": True}
+        assert not captured["path"].exists()
+
+    @pytest.mark.asyncio
+    async def test_cancel_stops_cli_process(self, provider, monkeypatch):
+        """Cancelling a completion stops the CLI instead of leaving it running."""
+        import sys
+
+        from chunkhound.providers.llm import claude_code_cli_provider as mod
+        from tests.helpers import cli_runs_after_cancel
+
+        monkeypatch.setattr(mod, "resolve_cli_binary", lambda name: sys.executable)
+        assert not await cli_runs_after_cancel(
+            monkeypatch, mod, lambda: provider.complete("Test prompt")
+        )
+
+    @pytest.mark.asyncio
+    async def test_complete_disables_tools_with_empty_tools_value(
+        self, provider, mock_subprocess
+    ):
+        """--tools "" disables built-in tools and stays a separate argv token."""
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (b"ok", b"")
+        mock_subprocess.return_value = mock_process
+
+        await provider.complete("Test prompt")
+
+        cmd = mock_subprocess.call_args.args
+        # mock_subprocess fixture uses a .exe path → multi-token argv
+        assert list(cmd[-2:]) == ["--tools", ""]
+        assert "--disallowedTools" not in cmd
+        assert "--append-system-prompt" not in cmd
+        assert "--append-system-prompt-file" not in cmd
+        assert mock_process.communicate.await_args.kwargs["input"] == b"Test prompt"
+
+    @pytest.mark.asyncio
+    async def test_default_sends_system_prompt_as_file(
+        self, provider, mock_subprocess
+    ):
+        """The default puts instructions in a file and the request on stdin."""
+        from pathlib import Path
+
+        written: dict[str, object] = {}
+
+        async def read_file(input=None):
+            cmd = mock_subprocess.call_args.args
+            path = Path(cmd[cmd.index("--append-system-prompt-file") + 1])
+            written["text"] = path.read_text(encoding="utf-8")
+            written["stdin"] = input
+            return (b"ok", b"")
+
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate = read_file
+        mock_subprocess.return_value = mock_process
+
+        await provider.complete("User prompt", system="System instructions")
+
+        cmd = mock_subprocess.call_args.args
+        assert "--append-system-prompt" not in cmd
+        flag_at = cmd.index("--append-system-prompt-file")
+        assert flag_at < cmd.index("--tools")
+        assert list(cmd[-2:]) == ["--tools", ""]
+        assert written["text"] == "System instructions"
+        assert "System instructions" not in cmd
+        assert written["stdin"] == b"User prompt"
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        path = Path(cmd[flag_at + 1])
+        mcp_path = Path(cmd[cmd.index("--mcp-config") + 1])
+        assert path.resolve().parent == temp_root
+        assert mcp_path.resolve().parent == temp_root
+        assert mock_subprocess.call_args.kwargs["cwd"] == tempfile.gettempdir()
+        assert not path.exists()
+
+    @pytest.mark.asyncio
+    async def test_batch_shim_sends_system_prompt_as_file(self, monkeypatch):
+        """A .cmd shim receives the instruction text in a file, not on argv."""
+        from pathlib import Path
+
+        captured: dict[str, object] = {}
+
+        async def fake_exec(*args, **kwargs):
+            cmd = [str(part) for part in args]
+            captured["cmd"] = cmd
+            process = AsyncMock()
+            process.returncode = 0
+
+            async def fake_communicate(input=None):
+                path = Path(cmd[cmd.index("--append-system-prompt-file") + 1])
+                captured["file"] = path.read_text(encoding="utf-8")
+                captured["stdin"] = input
+                return (b"ok", b"")
+
+            process.communicate = fake_communicate
+            return process
+
+        monkeypatch.setattr(
+            "chunkhound.providers.llm.base_cli_provider.sys.platform",
+            "win32",
+        )
+        monkeypatch.setattr(
+            "chunkhound.providers.llm.claude_code_cli_provider.resolve_cli_binary",
+            lambda name: r"C:\npm\claude.cmd",
+        )
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+        system = 'You are "helpful".\nFact: 100% done.'
+        provider = ClaudeCodeCLIProvider(
+            model="claude-sonnet-4-5-20250929",
+            max_retries=1,
+        )
+        response = await provider.complete("User prompt", system=system)
+
+        cmd = captured["cmd"]
+        assert isinstance(cmd, list)
+        assert response.content == "ok"
+        assert "--append-system-prompt" not in cmd
+        assert "--append-system-prompt-file" in cmd
+        assert list(cmd[-2:]) == ["--tools", ""]
+        assert "--disallowedTools" not in cmd
+        rendered = " ".join(cmd)
+        assert "\n" not in rendered
+        assert "%" not in rendered
+        assert '"' not in rendered
+        assert captured["file"] == system
+        assert captured["stdin"] == b"User prompt"
+
+    @pytest.mark.asyncio
+    async def test_inline_on_batch_shim_rejects_cmd_unsafe_text(self, monkeypatch):
+        """Inline mode on a .cmd shim refuses text cmd.exe would rewrite."""
+        monkeypatch.setattr(
+            "chunkhound.providers.llm.base_cli_provider.sys.platform",
+            "win32",
+        )
+        monkeypatch.setattr(
+            "chunkhound.providers.llm.claude_code_cli_provider.resolve_cli_binary",
+            lambda name: r"C:\npm\claude.cmd",
+        )
+
+        provider = ClaudeCodeCLIProvider(
+            model="claude-sonnet-4-5-20250929",
+            max_retries=1,
+            append_system_prompt="inline",
+        )
+        with pytest.raises(RuntimeError, match="quote"):
+            await provider.complete("User prompt", system='Say "hello"')
+
+    @pytest.mark.asyncio
+    async def test_mcp_config_temp_file_removed_after_cli_error(
+        self, provider, mock_subprocess
+    ):
+        """Temp MCP config is unlinked even when the CLI fails."""
+        from pathlib import Path
+
+        mock_process = AsyncMock()
+        mock_process.returncode = 1
+        mock_process.communicate.return_value = (b"", b"fail")
+        mock_subprocess.return_value = mock_process
+        provider._max_retries = 1
+
+        with pytest.raises(RuntimeError, match="CLI command failed"):
+            await provider.complete("Test prompt")
+
+        cmd = mock_subprocess.call_args.args
+        assert "--mcp-config" in cmd
+        cfg = Path(cmd[cmd.index("--mcp-config") + 1])
+        assert not cfg.exists()
+
+    @pytest.mark.asyncio
+    async def test_mcp_config_write_error_is_runtime_error(self, provider, monkeypatch):
+        """A failed MCP config write stays inside the RuntimeError contract."""
+
+        def _boom(directory=None):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(
+            "chunkhound.providers.llm.claude_code_cli_provider.resolve_cli_binary",
+            lambda name: r"C:\fake\claude.exe",
+        )
+        monkeypatch.setattr(
+            "chunkhound.providers.llm.claude_code_cli_provider._write_empty_mcp_config_file",
+            _boom,
+        )
+        with pytest.raises(RuntimeError, match="Claude MCP config"):
+            await provider.complete("Test prompt")
+
+    @pytest.mark.asyncio
+    async def test_write_empty_mcp_config_file_contents(self, tmp_path, monkeypatch):
+        """Temp MCP config is valid empty-servers JSON."""
+        import json
+
+        from chunkhound.providers.llm import claude_code_cli_provider as mod
+
+        monkeypatch.setattr(
+            mod.tempfile,
+            "mkstemp",
+            lambda **kwargs: (
+                os.open(
+                    str(tmp_path / "chunkhound_claude_mcp_test.json"),
+                    os.O_RDWR | os.O_CREAT | os.O_TRUNC,
+                ),
+                str(tmp_path / "chunkhound_claude_mcp_test.json"),
+            ),
+        )
+        path = mod._write_empty_mcp_config_file()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            assert data == {"mcpServers": {}}
+        finally:
+            path.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    async def test_complete_success(self, provider, mock_subprocess):
+        """Test successful completion."""
+        # Mock subprocess to return success
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (b"Test response", b"")
+        mock_subprocess.return_value = mock_process
+
+        response = await provider.complete("Test prompt")
+
+        assert isinstance(response, LLMResponse)
+        assert response.content == "Test response"
+        assert response.model == "claude-sonnet-4-5-20250929"
+        assert response.tokens_used > 0
+        assert response.finish_reason == "stop"
+
+        # Verify usage tracking
+        assert provider._requests_made == 1
+        assert provider._estimated_tokens_used > 0
+
+    @pytest.mark.asyncio
+    async def test_complete_with_system_prompt(self, provider, mock_subprocess):
+        """Test completion with system prompt."""
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (b"Response with system", b"")
+        mock_subprocess.return_value = mock_process
+
+        response = await provider.complete("User prompt", system="System instructions")
+
+        assert response.content == "Response with system"
+        cmd = mock_subprocess.call_args.args
+        assert "--append-system-prompt-file" in cmd
+        assert "--append-system-prompt" not in cmd
+        assert mock_process.communicate.await_args.kwargs["input"] == b"User prompt"
+
+    @pytest.mark.asyncio
+    async def test_inline_sends_system_prompt_as_argument(
+        self, mock_subprocess
+    ):
+        """inline puts the instruction text on --append-system-prompt."""
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (b"ok", b"")
+        mock_subprocess.return_value = mock_process
+
+        provider = ClaudeCodeCLIProvider(
+            model="claude-sonnet-4-5-20250929",
+            max_retries=1,
+            append_system_prompt="inline",
+        )
+        await provider.complete("User prompt", system="System instructions")
+
+        cmd = mock_subprocess.call_args.args
+        assert cmd[cmd.index("--append-system-prompt") + 1] == "System instructions"
+        assert "--append-system-prompt-file" not in cmd
+        assert list(cmd[-2:]) == ["--tools", ""]
+        assert mock_process.communicate.await_args.kwargs["input"] == b"User prompt"
+
+    @pytest.mark.asyncio
+    async def test_llm_config_inline_reaches_the_cli(self, mock_subprocess):
+        """llm.claude_append_system_prompt=inline changes the flag Claude gets."""
+        from chunkhound.core.config.llm_config import LLMConfig
+        from chunkhound.llm_manager import LLMManager
+
+        cfg = LLMConfig(
+            provider="claude-code-cli",
+            utility_model="claude-sonnet-4-5-20250929",
+            synthesis_model="claude-sonnet-4-5-20250929",
+            claude_append_system_prompt="inline",
+        )
+        utility, synthesis = cfg.get_provider_configs()
+        manager = LLMManager(utility, synthesis)
+        provider = manager.get_utility_provider()
+
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (b"ok", b"")
+        mock_subprocess.return_value = mock_process
+
+        await provider.complete("User prompt", system="Rules")
+
+        cmd = mock_subprocess.call_args.args
+        assert cmd[cmd.index("--append-system-prompt") + 1] == "Rules"
+        assert "--append-system-prompt-file" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_temp_dir_holds_claude_files(self, tmp_path, mock_subprocess):
+        """claude_temp_dir is where the instruction file and MCP file are written."""
+        from pathlib import Path
+
+        captured: dict[str, Path] = {}
+
+        async def read_files(input=None):
+            cmd = mock_subprocess.call_args.args
+            for flag in ("--mcp-config", "--append-system-prompt-file"):
+                captured[flag] = Path(cmd[cmd.index(flag) + 1])
+            return (b"ok", b"")
+
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate = read_files
+        mock_subprocess.return_value = mock_process
+
+        provider = ClaudeCodeCLIProvider(
+            model="claude-sonnet-4-5-20250929",
+            max_retries=1,
+            temp_dir=str(tmp_path),
+        )
+        await provider.complete("User prompt", system="Rules")
+
+        assert captured["--append-system-prompt-file"].parent == tmp_path
+        assert captured["--mcp-config"].parent == tmp_path
+        assert mock_subprocess.call_args.kwargs["cwd"] == tempfile.gettempdir()
+        assert not captured["--append-system-prompt-file"].exists()
+        assert not captured["--mcp-config"].exists()
+
+    @pytest.mark.asyncio
+    async def test_missing_temp_dir_is_runtime_error(self, tmp_path, mock_subprocess):
+        """A temp directory that is not a directory fails before launch."""
+        provider = ClaudeCodeCLIProvider(
+            model="claude-sonnet-4-5-20250929",
+            max_retries=1,
+            temp_dir=str(tmp_path / "missing"),
+        )
+        with pytest.raises(RuntimeError, match="llm.claude_temp_dir is not a directory"):
+            await provider.complete("User prompt", system="Rules")
+        mock_subprocess.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_complete_timeout(self, provider, mock_subprocess, monkeypatch):
+        """A timeout kills the process on the POSIX branch of the helper."""
+        monkeypatch.setattr(
+            "chunkhound.providers.llm.base_cli_provider.sys.platform", "linux"
+        )
+        mock_process = AsyncMock()
+        mock_process.returncode = None
+        mock_process.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+        mock_process.kill = MagicMock()
+        mock_process.wait = AsyncMock()
+        mock_subprocess.return_value = mock_process
+
+        with pytest.raises(RuntimeError, match="CLI command timed out"):
+            await provider.complete("Test prompt", timeout=1)
+
+        assert mock_process.kill.call_count == 3
+        assert mock_process.wait.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_complete_timeout_ignores_stale_process_lookup_error(
+        self, provider, mock_subprocess, monkeypatch
+    ):
+        """A process that is already gone must not mask the timeout error."""
+        monkeypatch.setattr(
+            "chunkhound.providers.llm.base_cli_provider.sys.platform", "linux"
+        )
+        mock_process = AsyncMock()
+        mock_process.returncode = None
+        mock_process.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+        mock_process.kill = MagicMock(side_effect=ProcessLookupError())
+        mock_process.wait = AsyncMock()
+        mock_subprocess.return_value = mock_process
+
+        with pytest.raises(RuntimeError, match="CLI command timed out"):
+            await provider.complete("Test prompt", timeout=1)
+
+        assert mock_process.wait.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_complete_generic_failure_ignores_stale_process_lookup_error(
+        self, provider, mock_subprocess, monkeypatch
+    ):
+        """Unexpected failures must survive a process that is already gone."""
+        monkeypatch.setattr(
+            "chunkhound.providers.llm.base_cli_provider.sys.platform", "linux"
+        )
+        mock_process = AsyncMock()
+        mock_process.returncode = None
+        mock_process.communicate = AsyncMock(side_effect=ValueError("boom"))
+        mock_process.kill = MagicMock(side_effect=ProcessLookupError())
+        mock_process.wait = AsyncMock()
+        mock_subprocess.return_value = mock_process
+
+        with pytest.raises(RuntimeError, match="CLI command failed: boom"):
+            await provider.complete("Test prompt")
+
+        assert mock_process.wait.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_complete_cli_error(self, provider, mock_subprocess):
+        """Test handling of CLI errors."""
+        mock_process = AsyncMock()
+        mock_process.returncode = 1
+        mock_process.communicate.return_value = (b"", b"CLI error message")
+        mock_subprocess.return_value = mock_process
+
+        with pytest.raises(RuntimeError, match="CLI command failed"):
+            await provider.complete("Test prompt")
+
+    @pytest.mark.asyncio
+    async def test_complete_structured_success(self, provider, mock_subprocess):
+        """Test successful structured completion with JSON."""
+        json_response = {"result": "success", "data": [1, 2, 3]}
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (
+            json.dumps(json_response).encode("utf-8"),
+            b"",
+        )
+        mock_subprocess.return_value = mock_process
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "result": {"type": "string"},
+                "data": {"type": "array"},
+            },
+            "required": ["result", "data"],
+        }
+
+        response = await provider.complete_structured("Test prompt", schema)
+
+        assert isinstance(response, dict)
+        assert response["result"] == "success"
+        assert response["data"] == [1, 2, 3]
+
+    @pytest.mark.asyncio
+    async def test_complete_structured_with_markdown_code_block(
+        self, provider, mock_subprocess
+    ):
+        """Test structured completion with JSON in markdown code block."""
+        json_response = {"result": "success"}
+        markdown_response = f"```json\n{json.dumps(json_response)}\n```"
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (markdown_response.encode("utf-8"), b"")
+        mock_subprocess.return_value = mock_process
+
+        schema = {"type": "object", "properties": {"result": {"type": "string"}}}
+
+        response = await provider.complete_structured("Test prompt", schema)
+
+        assert isinstance(response, dict)
+        assert response["result"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_complete_structured_invalid_json(self, provider, mock_subprocess):
+        """Test handling of invalid JSON in structured completion."""
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (b"Not valid JSON!", b"")
+        mock_subprocess.return_value = mock_process
+
+        schema = {"type": "object"}
+
+        with pytest.raises(RuntimeError, match="Invalid JSON"):
+            await provider.complete_structured("Test prompt", schema)
+
+    @pytest.mark.asyncio
+    async def test_complete_structured_missing_required_field(
+        self, provider, mock_subprocess
+    ):
+        """Test validation of required fields in structured output."""
+        json_response = {"data": [1, 2, 3]}  # Missing 'result'
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (
+            json.dumps(json_response).encode("utf-8"),
+            b"",
+        )
+        mock_subprocess.return_value = mock_process
+
+        schema = {
+            "type": "object",
+            "properties": {"result": {"type": "string"}, "data": {"type": "array"}},
+            "required": ["result", "data"],
+        }
+
+        with pytest.raises(RuntimeError, match="schema validation failed"):
+            await provider.complete_structured("Test prompt", schema)
+
+    @pytest.mark.asyncio
+    async def test_complete_structured_rejects_additional_properties(
+        self, provider, mock_subprocess
+    ):
+        """Test full JSON Schema validation in CLI fallback mode."""
+        json_response = {"result": "success", "extra": True}
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (
+            json.dumps(json_response).encode("utf-8"),
+            b"",
+        )
+        mock_subprocess.return_value = mock_process
+
+        schema = {
+            "type": "object",
+            "properties": {"result": {"type": "string"}},
+            "required": ["result"],
+            "additionalProperties": False,
+        }
+
+        with pytest.raises(RuntimeError, match="schema validation failed"):
+            await provider.complete_structured("Test prompt", schema)
+
+    @pytest.mark.asyncio
+    async def test_complete_structured_rejects_nested_schema_violation(
+        self, provider, mock_subprocess
+    ):
+        """Nested array/object constraints must be enforced."""
+        json_response = {"items": [{"label": 7}]}
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (
+            json.dumps(json_response).encode("utf-8"),
+            b"",
+        )
+        mock_subprocess.return_value = mock_process
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"label": {"type": "string"}},
+                        "required": ["label"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["items"],
+            "additionalProperties": False,
+        }
+
+        with pytest.raises(RuntimeError, match="schema validation failed"):
+            await provider.complete_structured("Test prompt", schema)
+
+    @pytest.mark.asyncio
+    async def test_batch_complete(self, provider, mock_subprocess):
+        """Test batch completion (sequential calls)."""
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        # Return different responses for each call
+        responses = [b"Response 1", b"Response 2", b"Response 3"]
+        mock_process.communicate.side_effect = [(resp, b"") for resp in responses]
+        mock_subprocess.return_value = mock_process
+
+        prompts = ["Prompt 1", "Prompt 2", "Prompt 3"]
+        results = await provider.batch_complete(prompts)
+
+        assert len(results) == 3
+        assert all(isinstance(r, LLMResponse) for r in results)
+        # Note: Due to mocking, all responses will be the same
+        # In a real scenario with proper mocking, we'd verify each response
+
+    @pytest.mark.asyncio
+    async def test_health_check_healthy(self, provider, mock_subprocess):
+        """Test health check when CLI is available and working."""
+        mock_process = AsyncMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = (b"OK", b"")
+        mock_subprocess.return_value = mock_process
+
+        result = await provider.health_check()
+
+        assert result["status"] == "healthy"
+        assert result["provider"] == "claude-code-cli"
+        assert result["model"] == "claude-sonnet-4-5-20250929"
+        assert "test_response" in result
+
+    @pytest.mark.asyncio
+    async def test_health_check_cli_not_found(self, provider, mock_subprocess):
+        """Test health check when CLI is not available."""
+        mock_subprocess.side_effect = FileNotFoundError("claude: command not found")
+
+        result = await provider.health_check()
+
+        assert result["status"] == "unhealthy"
+        assert result["provider"] == "claude-code-cli"
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_health_check_cli_fails(self, provider, mock_subprocess):
+        """Test health check when CLI call fails."""
+        mock_subprocess.side_effect = RuntimeError("CLI failed")
+
+        result = await provider.health_check()
+
+        assert result["status"] == "unhealthy"
+        assert "error" in result
+
+    def test_get_usage_stats(self, provider):
+        """Test usage statistics retrieval."""
+        # Initially zero
+        stats = provider.get_usage_stats()
+        assert stats["requests_made"] == 0
+        assert stats["total_tokens_estimated"] == 0
+
+        # Manually increment (normally done by complete methods)
+        provider._requests_made = 5
+        provider._estimated_tokens_used = 1000
+        provider._estimated_prompt_tokens = 600
+        provider._estimated_completion_tokens = 400
+
+        stats = provider.get_usage_stats()
+        assert stats["requests_made"] == 5
+        assert stats["total_tokens_estimated"] == 1000
+        assert stats["prompt_tokens_estimated"] == 600
+        assert stats["completion_tokens_estimated"] == 400
+
+    @pytest.mark.asyncio
+    async def test_retry_logic(self, provider, mock_subprocess):
+        """Test that retries work correctly on failure."""
+        # First two attempts fail, third succeeds
+        mock_process_fail = AsyncMock()
+        mock_process_fail.returncode = 1
+        mock_process_fail.communicate.return_value = (b"", b"Error")
+
+        mock_process_success = AsyncMock()
+        mock_process_success.returncode = 0
+        mock_process_success.communicate.return_value = (b"Success", b"")
+
+        mock_subprocess.side_effect = [
+            mock_process_fail,
+            mock_process_fail,
+            mock_process_success,
+        ]
+
+        response = await provider.complete("Test prompt")
+
+        assert response.content == "Success"
+        # Should have tried 3 times
+        assert mock_subprocess.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_max_retries_exceeded(self, provider, mock_subprocess):
+        """Test that error is raised after max retries."""
+        mock_process = AsyncMock()
+        mock_process.returncode = 1
+        mock_process.communicate.return_value = (b"", b"Persistent error")
+        mock_subprocess.return_value = mock_process
+
+        with pytest.raises(RuntimeError, match="CLI command failed"):
+            await provider.complete("Test prompt")
+
+        # Should have tried max_retries (3) times
+        assert mock_subprocess.call_count == 3
+
+    def test_default_timeout(self):
+        """Test that default timeout (no explicit param) resolves to 120."""
+        p = ClaudeCodeCLIProvider()
+        assert p.timeout == DEFAULT_LLM_TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_timeout_with_already_terminated_process(
+        self,
+        provider,
+        mock_subprocess,
+    ):
+        """Test that process is not killed if already terminated."""
+        # Mock process that terminates before we can kill it
+        mock_process = AsyncMock()
+        mock_process.returncode = 0  # Process already terminated
+        mock_process.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+        mock_process.kill = MagicMock()
+        mock_process.wait = AsyncMock()
+        mock_subprocess.return_value = mock_process
+
+        with pytest.raises(RuntimeError, match="CLI command timed out"):
+            await provider.complete("Test prompt", timeout=1)
+
+        mock_process.kill.assert_not_called()
+        mock_process.wait.assert_not_called()

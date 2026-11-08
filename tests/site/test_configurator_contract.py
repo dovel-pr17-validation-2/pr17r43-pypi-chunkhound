@@ -1,0 +1,310 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from chunkhound.api.cli.utils.config_factory import create_validated_config
+from chunkhound.core.config.config import Config
+from tests.site.tsx_runner import run_tsx_json
+
+
+def _load_preset(provider_list: str, preset_id: str) -> dict:
+    """Load a preset config from configurator-data.ts by provider list and id."""
+    script = f"""
+import {{ {provider_list} }} from './site/src/components/configurator-data.ts';
+
+const option = {provider_list}.find((provider) => provider.id === '{preset_id}');
+if (!option) {{
+  throw new Error('missing {preset_id} option');
+}}
+
+console.log(JSON.stringify(option.config));
+"""
+    return run_tsx_json(script)
+
+
+def test_ollama_llm_configurator_emits_explicit_local_model() -> None:
+    config = _load_preset("llmProviders", "ollama-llm")
+
+    assert config["provider"] == "openai"
+    assert config["base_url"] == "http://localhost:11434/v1"
+    assert config["model"] == "qwen3-coder:30b"
+
+
+def test_ollama_embed_configurator_has_qwen3_reranker() -> None:
+    config = _load_preset("embeddingProviders", "ollama-embed")
+
+    assert config["model"] == "qwen3-embedding"
+    assert config["rerank_model"] == "qwen3-reranker"
+    assert config["rerank_format"] == "cohere"
+
+
+def test_vllm_embed_configurator_has_qwen3_models() -> None:
+    config = _load_preset("embeddingProviders", "vllm-embed")
+
+    assert config["model"] == "Qwen/Qwen3-Embedding-0.6B"
+    assert config["rerank_model"] == "Qwen/Qwen3-Reranker-0.6B"
+    assert "rerank_url" not in config
+
+
+def test_vllm_llm_configurator_has_qwen3_coder() -> None:
+    config = _load_preset("llmProviders", "vllm-llm")
+
+    assert config["model"] == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+    assert config["base_url"] == "http://localhost:8000/v1"
+
+
+def test_openai_embed_configurator_has_no_rerank_url() -> None:
+    config = _load_preset("embeddingProviders", "openai-embed")
+
+    assert "rerank_url" not in config
+
+
+def _build_chunkhound_config(embedding_id: str, llm_id: str) -> dict:
+    script = f"""
+import {{
+  buildChunkhoundConfig,
+  embeddingProviders,
+  llmProviders,
+}} from './site/src/components/configurator-data.ts';
+
+const embedding = embeddingProviders.find(
+  (provider) => provider.id === '{embedding_id}'
+);
+const llm = llmProviders.find(
+  (provider) => provider.id === '{llm_id}'
+);
+if (!embedding || !llm) {{
+  throw new Error('missing provider');
+}}
+
+console.log(JSON.stringify(buildChunkhoundConfig(embedding, llm)));
+"""
+    return run_tsx_json(script)
+
+
+def test_configurator_local_openai_compatible_presets_round_trip_through_backend_config(
+) -> None:
+    ollama_config = Config(
+        **_build_chunkhound_config("ollama-embed", "ollama-llm")
+    )
+    vllm_config = Config(
+        **_build_chunkhound_config("vllm-embed", "vllm-llm")
+    )
+
+    assert ollama_config.embedding is not None
+    assert ollama_config.embedding.base_url == "http://localhost:11434/v1"
+    assert ollama_config.embedding.rerank_url == "/rerank"
+    assert ollama_config.embedding.rerank_model == "qwen3-reranker"
+    assert ollama_config.llm is not None
+    assert ollama_config.llm.base_url == "http://localhost:11434/v1"
+    assert ollama_config.llm.model == "qwen3-coder:30b"
+
+    assert vllm_config.embedding is not None
+    assert vllm_config.embedding.base_url == "http://localhost:8000/v1"
+    assert vllm_config.embedding.rerank_url == "/rerank"
+    assert vllm_config.embedding.rerank_model == "Qwen/Qwen3-Reranker-0.6B"
+    assert vllm_config.llm is not None
+    assert vllm_config.llm.base_url == "http://localhost:8000/v1"
+    assert vllm_config.llm.model == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+
+def _write_config(tmp_path, embedding_id: str, llm_id: str) -> str:
+    config_path = tmp_path / ".chunkhound.json"
+    config_path.write_text(
+        json.dumps(_build_chunkhound_config(embedding_id, llm_id)),
+        encoding="utf-8",
+    )
+    return str(config_path)
+
+
+def _validated_config_errors(
+    tmp_path, command: str, embedding_id: str, llm_id: str
+) -> list[str]:
+    args = SimpleNamespace(
+        command=command,
+        config=_write_config(tmp_path, embedding_id, llm_id),
+        path=str(tmp_path),
+        no_embeddings=False,
+        overview_only=False,
+        assets_only=False,
+    )
+    _config, errors = asyncio.run(create_validated_config(args, command))
+    return errors
+
+
+def test_ollama_generated_config_passes_index_validation(
+    tmp_path, clean_environment
+) -> None:
+    errors = _validated_config_errors(tmp_path, "index", "ollama-embed", "ollama-llm")
+
+    assert errors == []
+
+
+def test_ollama_generated_config_passes_research_validation(
+    tmp_path, clean_environment
+) -> None:
+    errors = _validated_config_errors(
+        tmp_path, "research", "ollama-embed", "ollama-llm"
+    )
+
+    assert errors == []
+
+
+def test_vllm_generated_config_passes_index_validation(
+    tmp_path, clean_environment
+) -> None:
+    errors = _validated_config_errors(tmp_path, "index", "vllm-embed", "vllm-llm")
+
+    assert errors == []
+
+
+def test_vllm_generated_config_passes_research_validation(
+    tmp_path, clean_environment
+) -> None:
+    errors = _validated_config_errors(tmp_path, "research", "vllm-embed", "vllm-llm")
+
+    assert errors == []
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_deepseek_llm_configurator_emits_model() -> None:
+    config = _load_preset("llmProviders", "deepseek")
+
+    assert config["provider"] == "deepseek"
+    assert config["model"] == "deepseek-v4-flash"
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_grok_llm_configurator_emits_model() -> None:
+    config = _load_preset("llmProviders", "grok")
+
+    assert config["provider"] == "grok"
+    assert config["model"] == "grok-4.3"
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_openrouter_llm_configurator_emits_model() -> None:
+    config = _load_preset("llmProviders", "openrouter")
+
+    assert config["provider"] == "openrouter"
+    assert config["model"] == "google/gemini-2.0-flash"
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_orcarouter_llm_configurator_emits_model() -> None:
+    config = _load_preset("llmProviders", "orcarouter")
+
+    assert config["provider"] == "orcarouter"
+    assert config["model"] == "anthropic/claude-sonnet-5"
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_requesty_llm_configurator_emits_model() -> None:
+    config = _load_preset("llmProviders", "requesty")
+
+    assert config["provider"] == "requesty"
+    assert config["model"] == "anthropic/claude-sonnet-5"
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_api_route_llm_configurator_emits_model() -> None:
+    config = _load_preset("llmProviders", "api-route")
+
+    assert config["provider"] == "api-route"
+    assert config["model"] == "gemini-3.5-flash"
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_api_route_config_passes_research_validation(
+    tmp_path, clean_environment
+) -> None:
+    errors = _validated_config_errors(
+        tmp_path, "research", "voyageai", "api-route"
+    )
+
+    assert errors == []
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_opper_llm_configurator_emits_model() -> None:
+    config = _load_preset("llmProviders", "opper")
+
+    assert config["provider"] == "opper"
+    assert config["model"] == "claude-sonnet-5"
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_obscurify_ai_llm_configurator_emits_model() -> None:
+    config = _load_preset("llmProviders", "obscurify-ai")
+
+    assert config["provider"] == "obscurify-ai"
+    assert config["model"] == "deepseek/deepseek-v4-flash"
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_atlascloud_llm_configurator_emits_model() -> None:
+    config = _load_preset("llmProviders", "atlascloud")
+
+    assert config["provider"] == "atlascloud"
+    assert config["model"] == "deepseek-ai/deepseek-v4-flash"
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_runcrate_llm_configurator_emits_model() -> None:
+    config = _load_preset("llmProviders", "runcrate")
+
+    assert config["provider"] == "runcrate"
+    assert config["model"] == "deepseek-ai/DeepSeek-V4.1-Flash"
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_cheapaimodel_llm_configurator_emits_model() -> None:
+    config = _load_preset("llmProviders", "cheapaimodel")
+
+    assert config["provider"] == "cheapaimodel"
+    assert config["model"] == "deepseek-v4-1-flash"
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_gemini_llm_configurator_emits_model() -> None:
+    config = _load_preset("llmProviders", "gemini")
+
+    assert config["provider"] == "gemini"
+    assert config["model"] == "gemini-3.5-flash"
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_deepseek_config_passes_research_validation(
+    tmp_path, clean_environment
+) -> None:
+    errors = _validated_config_errors(
+        tmp_path, "research", "voyageai", "deepseek"
+    )
+
+    assert errors == []
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_grok_config_passes_research_validation(
+    tmp_path, clean_environment
+) -> None:
+    errors = _validated_config_errors(
+        tmp_path, "research", "voyageai", "grok"
+    )
+
+    assert errors == []
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:.*configurator.*")
+def test_gemini_config_passes_research_validation(
+    tmp_path, clean_environment
+) -> None:
+    errors = _validated_config_errors(
+        tmp_path, "research", "voyageai", "gemini"
+    )
+
+    assert errors == []

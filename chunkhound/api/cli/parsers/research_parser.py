@@ -1,0 +1,77 @@
+"""Research command argument parser for ChunkHound CLI."""
+
+import argparse
+from pathlib import Path
+from typing import Any, cast
+
+from .common_arguments import (
+    add_common_arguments,
+    add_config_arguments,
+    add_git_diff_arguments,
+    nonempty_path_filter,
+)
+
+
+def add_research_subparser(subparsers: Any) -> argparse.ArgumentParser:
+    """Add research command subparser to the main parser.
+
+    Args:
+        subparsers: Subparsers object from the main argument parser
+
+    Returns:
+        The configured research subparser
+    """
+    research_parser = subparsers.add_parser(
+        "research",
+        help="Perform deep code research",
+        description=(
+            "Answer complex questions about codebase architecture and patterns. "
+            "Synthesis budgets scale automatically based on repository size."
+        ),
+    )
+
+    # Required query argument
+    research_parser.add_argument(
+        "query",
+        help="Research question to investigate",
+    )
+
+    # Optional positional argument with default to current directory
+    research_parser.add_argument(
+        "path",
+        nargs="?",
+        type=Path,
+        default=Path("."),
+        help="Directory path to research (default: current directory)",
+    )
+
+    research_parser.add_argument(
+        "--path-filter",
+        type=nonempty_path_filter,
+        help="Optional path filter (e.g., 'src/', 'tests/')",
+    )
+
+    research_parser.add_argument(
+        "--previous-query",
+        type=str,
+        default=None,
+        help=(
+            "Prior query for follow-up framing — synthesizer phrases the answer "
+            "in that topic's context. Does not steer which code is searched or "
+            "retrieved."
+        ),
+    )
+
+    # Git diff / commit-range arguments
+    add_git_diff_arguments(research_parser)
+
+    # Add common arguments
+    add_common_arguments(research_parser)
+
+    # Add config-specific arguments: database, embedding (reranking), llm, research
+    add_config_arguments(research_parser, ["database", "embedding", "llm", "research"])
+
+    return cast(argparse.ArgumentParser, research_parser)
+
+
+__all__: list[str] = ["add_research_subparser"]

@@ -1,0 +1,934 @@
+"""Centralized configuration management for ChunkHound.
+
+This module provides a unified configuration system with clear precedence:
+1. CLI arguments (highest priority)
+2. Explicit config file (via --config path or CHUNKHOUND_CONFIG_FILE)
+3. Local .chunkhound.json in target directory
+4. Global defaults (CHUNKHOUND_GLOBAL_CONFIG_FILE or auto-discovered under
+   ~/.config/chunkhound/ or ~/.chunkhound/)
+5. Environment variables
+6. Default values (lowest priority)
+
+Global config support means you can maintain common settings (API keys,
+indexing rules, etc.) in one place instead of copying .chunkhound.json
+to every project directory. Project-local files override the global layer.
+"""
+
+import copy
+import json
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from enum import Enum
+from pathlib import Path
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from chunkhound.utils.logging_guard import log_if_not_mcp
+
+from .analytics_config import AnalyticsConfig
+from .database_config import DatabaseConfig
+from .embedding_config import EmbeddingConfig
+from .fetchurl_config import FetchUrlConfig
+from .indexing_config import IndexingConfig
+from .llm_config import LLMConfig
+from .mcp_config import MCPConfig, is_loopback_host
+from .remote_config import RemoteConfig
+from .research_config import ResearchConfig
+
+
+class ConfigErrorCode(str, Enum):
+    """Stable machine-readable identifiers for `validate_for_command` errors.
+
+    Consumed by the remote-config terminal gate to compare pre-rules vs
+    post-rules error sets without depending on message-string wording.
+    """
+
+    MISSING_REQUIRED_CONFIG = "missing_required_config"
+    LLM_NOT_CONFIGURED = "llm_not_configured"
+    LLM_MISSING_ROLE_CONFIG = "llm_missing_role_config"
+    EMBEDDING_NOT_CONFIGURED = "embedding_not_configured"
+    MCP_NON_LOOPBACK_NO_AUTH = "mcp_non_loopback_no_auth"
+    MCP_CORS_NO_AUTH = "mcp_cors_no_auth"
+    DB_READONLY_WRONG_COMMAND = "db_readonly_wrong_command"
+    DB_READONLY_NON_DUCKDB = "db_readonly_non_duckdb"
+
+
+# Commands whose `validate_for_command_structured` gate must be re-checked by
+# the remote-config terminal delta gate, in addition to the current command.
+# Any new command whose command-scoped gate can be tripped by a
+# remote-pushable value must be added here. `research` stands in for the
+# LLM-requiring commands (`websearch`, `fetchurl`, `_quickresearch`) — its
+# LLM validation branch produces the same codes (`LLM_NOT_CONFIGURED`,
+# `LLM_MISSING_ROLE_CONFIG`) they all do, so covering it catches a payload
+# that would remove or break `llm.*` from any low-privilege invocation
+# (e.g. `search`) before it lands on disk and silently breaks the next
+# scheduled `research` run. `_daemon` is
+# intentionally not listed: its branches today only produce
+# `DB_READONLY_WRONG_COMMAND`, which `index` already covers, so adding it
+# would yield no net-new coverage. If a future change makes `_daemon`
+# structurally distinguishable at the terminal gate (e.g. by extending the
+# mcp host/auth gate at `validate_for_command_structured` to also fire for
+# `_daemon`), add it here at the same time.
+PERSISTENCE_HAZARD_COMMANDS: frozenset[str] = frozenset({"index", "mcp", "research"})
+
+
+# Env prefixes for every nested BaseSettings model. The persisted-gate
+# snapshot suppresses these so the outer skip_layers={"env"} is honest —
+# without it, EmbeddingConfig/LLMConfig/ResearchConfig/FetchUrlConfig
+# re-read env inside their own constructors and mask hazards that a
+# remote-config rule would persist. MCPConfig is a plain BaseModel and
+# needs no suppression.
+# When adding a new BaseSettings subconfig, add its env_prefix here.
+_NESTED_BASESETTINGS_ENV_PREFIXES: tuple[str, ...] = (
+    "CHUNKHOUND_EMBEDDING_",
+    "CHUNKHOUND_LLM_",
+    "CHUNKHOUND_RESEARCH_",
+    "CHUNKHOUND_FETCHURL_",
+)
+
+
+@contextmanager
+def _hide_nested_basesettings_env() -> Iterator[None]:
+    """Temporarily pop nested-BaseSettings env vars from ``os.environ``.
+
+    Matching is case-insensitive because the nested BaseSettings models
+    are configured with ``case_sensitive=False``; a lowercase env like
+    ``chunkhound_llm_api_key`` is still honored by pydantic and would
+    otherwise bypass this guard.
+
+    NOT thread-safe: mutates process-global ``os.environ``; do not call
+    concurrently with other code that reads ``CHUNKHOUND_*`` env vars.
+
+    See ``Config.snapshot_for_persisted_gate`` for the contract this
+    protects.
+    """
+    saved = {
+        k: os.environ.pop(k)
+        for k in list(os.environ)
+        if k.upper().startswith(_NESTED_BASESETTINGS_ENV_PREFIXES)
+    }
+    try:
+        yield
+    finally:
+        os.environ.update(saved)
+
+
+class Config(BaseModel):
+    """Centralized configuration for ChunkHound.
+
+    Precedence (highest first):
+    1. CLI arguments
+    2. Explicit config file (--config or CHUNKHOUND_CONFIG_FILE)
+    3. Local .chunkhound.json in target directory
+    4. Global defaults (CHUNKHOUND_GLOBAL_CONFIG_FILE or
+       ~/.config/chunkhound/*.json etc.)
+    5. Environment variables (CHUNKHOUND_*)
+    6. Defaults
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    embedding: EmbeddingConfig | None = Field(default=None)
+    llm: LLMConfig | None = Field(default=None)
+    mcp: MCPConfig = Field(default_factory=MCPConfig)
+    indexing: IndexingConfig = Field(default_factory=IndexingConfig)
+    research: ResearchConfig = Field(default_factory=ResearchConfig)
+    fetchurl: FetchUrlConfig = Field(default_factory=FetchUrlConfig)
+    remote_config: RemoteConfig | None = Field(default=None)
+    analytics: AnalyticsConfig = Field(default_factory=AnalyticsConfig)
+    debug: bool = Field(default=False)
+
+    # Private field to store the target directory from CLI args
+    target_dir: Path | None = Field(default=None, exclude=True)
+    # Private field to track if embeddings were explicitly disabled
+    embeddings_disabled: bool = Field(default=False, exclude=True)
+    # Private field to store the auto-discovered local .chunkhound.json path
+    local_config_file: Path | None = Field(default=None, exclude=True)
+    # Private field to store the global defaults config path
+    # (from home or CHUNKHOUND_GLOBAL_CONFIG_FILE)
+    global_config_file: Path | None = Field(default=None, exclude=True)
+    # Private field to store the explicit --config path (absolute) when provided
+    config_file: Path | None = Field(default=None, exclude=True)
+
+    @staticmethod
+    def get_global_config_candidates() -> list[Path]:
+        """Return preferred locations for global/user defaults config files.
+
+        These provide defaults that apply across projects without needing
+        a .chunkhound.json in every directory. Project-local .chunkhound.json
+        (and explicit --config) override values from global configs.
+        """
+        home = Path.home()
+        return [
+            home / ".config" / "chunkhound" / "chunkhound.json",
+            home / ".config" / "chunkhound" / ".chunkhound.json",
+            home / ".chunkhound" / "chunkhound.json",
+            home / ".chunkhound" / ".chunkhound.json",
+            home / "chunkhound.json",
+            home / ".chunkhound.json",
+        ]
+
+    def __init__(
+        self,
+        args: Any | None = None,
+        *,
+        skip_layers: set[Literal["env", "global", "local_config", "config_file", "cli"]]
+        | None = None,
+        global_override: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Universal configuration initialization that handles all contexts.
+
+        Automatically applies correct precedence order:
+        1. CLI arguments (highest priority)
+        2. Explicit config file (via --config path or CHUNKHOUND_CONFIG_FILE)
+        3. Local .chunkhound.json in target directory
+        4. Global defaults config (CHUNKHOUND_GLOBAL_CONFIG_FILE or discovered in
+           ~/.config/chunkhound/ or ~/.chunkhound/)
+        5. Environment variables
+        6. Default values (lowest priority)
+
+        Global config enables one set of defaults (e.g. embedding provider + key,
+        common excludes) without copying .chunkhound.json into every project.
+        Local project config and explicit/CLI always override globals.
+
+        Args:
+            args: Optional argparse.Namespace from command line parsing
+            skip_layers: Optional set of layer names to skip. Layer names are
+                {"env", "global", "local_config", "config_file", "cli"}. Default
+                None runs every layer (today's behavior). Used by the remote-
+                config pipeline to construct restricted-merge snapshots.
+            global_override: When non-None, the global-JSON layer uses this
+                pre-parsed dict instead of reading a candidate file from disk.
+                Used by the remote-config pipeline snapshot helpers
+                (``snapshot_from_global_dict``, ``snapshot_for_persisted_gate``,
+                ``snapshot_for_delta_gate``) to build snapshots without a
+                speculative disk write.
+            **kwargs: Direct overrides for testing or special cases
+        """
+        # Start with defaults
+        config_data: dict[str, Any] = {}
+
+        # 1. Smart config file resolution (before env vars)
+        config_file = None
+        command = getattr(args, "command", None) if args else None
+        is_map = command == "map"
+
+        # Extract target_dir from kwargs first (for testing)
+        target_dir = kwargs.pop("target_dir", None)
+        if target_dir is not None:
+            target_dir = Path(target_dir)
+
+        # Extract config file and target directory from args if provided
+        if args:
+            # Get config file from --config if present
+            if hasattr(args, "config") and args.config:
+                config_file = Path(args.config)
+                config_data["config_file"] = config_file.resolve()
+
+            # For most commands, args.path represents the project root used for config
+            # discovery. For map, args.path is a documentation scope and must
+            # not change config discovery.
+            if not is_map:
+                # Get target directory from args.path (overrides kwargs)
+                if hasattr(args, "path") and args.path:
+                    target_dir = Path(args.path)
+            elif target_dir is None and config_file is not None:
+                # For map, treat explicit --config as the workspace root.
+                target_dir = config_file.parent
+
+        # If no config file from args, check environment variable
+        if not config_file:
+            env_config_file = os.getenv("CHUNKHOUND_CONFIG_FILE")
+            if env_config_file:
+                config_file = Path(env_config_file)
+
+        if is_map and target_dir is None and config_file is not None:
+            # For map, treat CHUNKHOUND_CONFIG_FILE as the workspace root.
+            target_dir = config_file.parent
+
+        # Only detect project root if target_dir not provided
+        if target_dir is None:
+            from chunkhound.utils.project_detection import find_project_root
+
+            target_dir = find_project_root(
+                None if is_map else (getattr(args, "path", None) if args else None)
+            )
+
+        skips = skip_layers or set()
+
+        # 2. Load environment variables
+        if "env" not in skips:
+            self._apply_env(config_data)
+
+        # 2.5 Load global defaults config (env var or auto-discovered).
+        if "global" not in skips:
+            self._apply_global_json(config_data, override=global_override)
+
+        # 3. Check for local .chunkhound.json (overrides env vars and globals)
+        if "local_config" not in skips:
+            self._apply_local_json(config_data, target_dir, config_file)
+
+        # 4. Load explicit config file last so it wins over auto-discovered local config
+        if "config_file" not in skips:
+            self._apply_config_file(config_data, config_file)
+
+        # 5. Apply CLI arguments (highest precedence)
+        if "cli" not in skips and args:
+            self._apply_cli(config_data, args)
+
+        # 6. Apply any direct kwargs (for testing)
+        if kwargs:
+            self._mark_exclude_user_supplied(kwargs)
+            Config.deep_merge(config_data, kwargs)
+
+        # VOYAGE_API_KEY only fills in a missing key for the voyageai provider.
+        # Apply it after every layer is merged, so a provider chosen by a
+        # config file or a CLI flag gets the key too, not only an env provider.
+        if "env" not in skips:
+            self._apply_voyage_api_key_fallback(config_data)
+
+        # Special handling for EmbeddingConfig
+        if "embedding" in config_data and isinstance(config_data["embedding"], dict):
+            # Create EmbeddingConfig instance with the data
+            config_data["embedding"] = EmbeddingConfig(**config_data["embedding"])
+
+        # Special handling for LLMConfig
+        if "llm" in config_data and isinstance(config_data["llm"], dict):
+            # Create LLMConfig instance with the data
+            config_data["llm"] = LLMConfig(**config_data["llm"])
+
+        # Special handling for ResearchConfig
+        if "research" in config_data and isinstance(config_data["research"], dict):
+            # Create ResearchConfig instance with the data
+            config_data["research"] = ResearchConfig(**config_data["research"])
+
+        # Special handling for FetchUrlConfig
+        if "fetchurl" in config_data and isinstance(config_data["fetchurl"], dict):
+            # Create FetchUrlConfig instance with the data
+            config_data["fetchurl"] = FetchUrlConfig(**config_data["fetchurl"])
+
+        # Special handling for RemoteConfig. `RemoteConfig | None` follows the
+        # `embedding | None` / `llm | None` pattern (no default_factory), so
+        # Pydantic will not auto-coerce a dict from env/kwargs; this block is
+        # load-bearing.
+        if "remote_config" in config_data and isinstance(
+            config_data["remote_config"], dict
+        ):
+            config_data["remote_config"] = RemoteConfig(**config_data["remote_config"])
+
+        # Add target_dir to config_data for initialization
+        config_data["target_dir"] = target_dir
+
+        # Initialize the model
+        super().__init__(**config_data)
+
+    @staticmethod
+    def _mark_exclude_user_supplied(data: dict[str, Any]) -> None:
+        """Mark exclude list as user-supplied when present in indexing config."""
+        idx = data.get("indexing")
+        if isinstance(idx, dict) and isinstance(idx.get("exclude"), list):
+            idx["exclude_user_supplied"] = True
+
+    def _apply_env(self, config_data: dict[str, Any]) -> None:
+        """Merge environment-variable-derived values into ``config_data``."""
+        env_vars = self._load_env_vars()
+        Config.deep_merge(config_data, env_vars)
+
+    @staticmethod
+    def _apply_voyage_api_key_fallback(config_data: dict[str, Any]) -> None:
+        """Use ``VOYAGE_API_KEY`` when the merged embedding config selects
+        voyageai and no layer supplied an API key."""
+        embedding = config_data.get("embedding")
+        if not isinstance(embedding, dict) or embedding.get("api_key"):
+            return
+        if embedding.get("provider") != "voyageai":
+            return
+        if voyage_key := os.getenv("VOYAGE_API_KEY"):
+            embedding["api_key"] = voyage_key
+
+    def _apply_global_json(
+        self,
+        config_data: dict[str, Any],
+        override: dict[str, Any] | None = None,
+    ) -> None:
+        """Merge the global defaults JSON into ``config_data`` when discoverable.
+
+        If ``override`` is provided, use it as the pre-parsed global-JSON
+        payload instead of resolving a candidate file. Callers pass this to
+        build snapshot Configs without a speculative disk write.
+
+        ``override`` is deep-copied because ``deep_merge`` shares nested-dict
+        references, so ``_mark_exclude_user_supplied`` would otherwise mutate
+        the caller's dict and leak the internal marker into the persisted
+        global JSON on the pipeline's next write.
+        """
+        if override is not None:
+            Config.deep_merge(config_data, copy.deepcopy(override))
+            self._mark_exclude_user_supplied(config_data)
+            return
+
+        global_config_file: Path | None = None
+        env_global = os.getenv("CHUNKHOUND_GLOBAL_CONFIG_FILE")
+        if env_global:
+            global_config_file = Path(env_global)
+            if global_config_file.exists():
+                config_data["global_config_file"] = global_config_file.resolve()
+            else:
+                # Missing env-pinned target is a bootstrap case, not an error —
+                # the remote-config pipeline creates it on first apply. WARN so
+                # a typo is distinguishable from first-run.
+                log_if_not_mcp(
+                    "WARNING",
+                    "CHUNKHOUND_GLOBAL_CONFIG_FILE={} does not exist — "
+                    "treating as empty. The remote-config pipeline will "
+                    "create it on first apply if enabled; otherwise check "
+                    "the path or unset the variable.",
+                    global_config_file,
+                )
+                global_config_file = None
+        else:
+            for candidate in self.get_global_config_candidates():
+                if candidate.exists() and candidate.is_file():
+                    global_config_file = candidate
+                    config_data["global_config_file"] = global_config_file.resolve()
+                    break
+
+        if global_config_file:
+            try:
+                with open(global_config_file) as f:
+                    global_config = json.load(f)
+                    Config.deep_merge(config_data, global_config)
+                    self._mark_exclude_user_supplied(config_data)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Invalid JSON in global config file {global_config_file}: {e}. "
+                    "Please check the file format and try again."
+                )
+
+    def _apply_local_json(
+        self,
+        config_data: dict[str, Any],
+        target_dir: Path | None,
+        config_file: Path | None,
+    ) -> None:
+        """Merge ``target_dir/.chunkhound.json`` into ``config_data`` when present."""
+        if target_dir and target_dir.exists():
+            local_config_path = target_dir / ".chunkhound.json"
+            if local_config_path.exists() and local_config_path != config_file:
+                config_data["local_config_file"] = local_config_path.resolve()
+                try:
+                    with open(local_config_path) as f:
+                        local_config = json.load(f)
+                        # Trust boundary: remote-config URL/header must come
+                        # from operator-controlled surfaces (CLI or env), never
+                        # from a file — a project-local .chunkhound.json in a
+                        # cloned repo could otherwise redirect the fetch to an
+                        # attacker-controlled URL on first run.
+                        if local_config.pop("remote_config", None) is not None:
+                            log_if_not_mcp(
+                                "WARNING",
+                                "Ignoring 'remote_config' in {} — remote-config "
+                                "URL/auth may only be set via CLI flags, "
+                                "CHUNKHOUND_REMOTE_CONFIG__* env vars, or the "
+                                "global config file.",
+                                local_config_path,
+                            )
+                        Config.deep_merge(config_data, local_config)
+                        self._mark_exclude_user_supplied(config_data)
+                except json.JSONDecodeError as e:
+                    raise ValueError(
+                        f"Invalid JSON in config file {local_config_path}: {e}. "
+                        "Please check the file format and try again."
+                    )
+
+    def _apply_config_file(
+        self, config_data: dict[str, Any], config_file: Path | None
+    ) -> None:
+        """Merge the explicit ``--config`` JSON into ``config_data`` when supplied."""
+        if config_file and not config_file.exists():
+            raise ValueError(
+                f"Config file not found: {config_file}. "
+                "Check the path or visit https://chunkhound.ai to generate a config."
+            )
+        if config_file:
+            try:
+                with open(config_file) as f:
+                    file_config = json.load(f)
+                    # Trust boundary: see _apply_local_json — same reasoning
+                    # applies to an explicit --config file, which can just as
+                    # easily be a checked-in artifact from an untrusted source.
+                    if file_config.pop("remote_config", None) is not None:
+                        log_if_not_mcp(
+                            "WARNING",
+                            "Ignoring 'remote_config' in {} — remote-config "
+                            "URL/auth may only be set via CLI flags, "
+                            "CHUNKHOUND_REMOTE_CONFIG__* env vars, or the "
+                            "global config file.",
+                            config_file,
+                        )
+                    Config.deep_merge(config_data, file_config)
+                    self._mark_exclude_user_supplied(config_data)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Invalid JSON in config file {config_file}: {e}. "
+                    "Please check the file format and try again."
+                )
+
+    def _apply_cli(self, config_data: dict[str, Any], args: Any) -> None:
+        """Merge CLI-argument-derived overrides into ``config_data``."""
+        cli_overrides = self._extract_cli_overrides(args)
+        self._mark_exclude_user_supplied(cli_overrides)
+        Config.deep_merge(config_data, cli_overrides)
+
+    def _load_env_vars(self) -> dict[str, Any]:
+        """Load configuration from environment variables.
+
+        Supports both legacy and new environment variable names.
+        Uses CHUNKHOUND_ prefix with __ delimiter for nested values.
+        """
+        config: dict[str, Any] = {}
+
+        # Debug mode
+        if os.getenv("CHUNKHOUND_DEBUG"):
+            config["debug"] = os.getenv("CHUNKHOUND_DEBUG", "").lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+
+        # Delegate to each config class
+        if db_config := DatabaseConfig.load_from_env():
+            config["database"] = db_config
+        if embedding_config := EmbeddingConfig.load_from_env():
+            config["embedding"] = embedding_config
+        if llm_config := LLMConfig.load_from_env():
+            config["llm"] = llm_config
+        if mcp_config := MCPConfig.load_from_env():
+            config["mcp"] = mcp_config
+        if indexing_config := IndexingConfig.load_from_env():
+            config["indexing"] = indexing_config
+        if research_config := ResearchConfig.load_from_env():
+            config["research"] = research_config
+        if fetchurl_config := FetchUrlConfig.load_from_env():
+            config["fetchurl"] = fetchurl_config
+        if remote_config := RemoteConfig.load_from_env():
+            config["remote_config"] = remote_config
+        if analytics_config := AnalyticsConfig.load_from_env():
+            config["analytics"] = analytics_config
+
+        return config
+
+    def _extract_cli_overrides(self, args: Any) -> dict[str, Any]:
+        """Extract configuration overrides from CLI arguments.
+
+        Args:
+            args: Parsed command line arguments
+
+        Returns:
+            Dictionary of configuration overrides
+        """
+        overrides: dict[str, Any] = {}
+
+        # Common CLI args
+        if hasattr(args, "debug") and args.debug:
+            overrides["debug"] = args.debug
+        elif hasattr(args, "verbose") and args.verbose:
+            overrides["debug"] = args.verbose
+
+        # Delegate to each config class
+        if db_overrides := DatabaseConfig.extract_cli_overrides(args):
+            overrides["database"] = db_overrides
+        if embedding_overrides := EmbeddingConfig.extract_cli_overrides(args):
+            # Handle special case for --no-embeddings
+            if embedding_overrides.get("disabled"):
+                overrides["embedding"] = None
+                overrides["embeddings_disabled"] = True
+            else:
+                overrides["embedding"] = embedding_overrides
+        if llm_overrides := LLMConfig.extract_cli_overrides(args):
+            overrides["llm"] = llm_overrides
+        if mcp_overrides := MCPConfig.extract_cli_overrides(args):
+            overrides["mcp"] = mcp_overrides
+        if indexing_overrides := IndexingConfig.extract_cli_overrides(args):
+            overrides["indexing"] = indexing_overrides
+        if research_overrides := ResearchConfig.extract_cli_overrides(args):
+            overrides["research"] = research_overrides
+        if fetchurl_overrides := FetchUrlConfig.extract_cli_overrides(args):
+            overrides["fetchurl"] = fetchurl_overrides
+        if remote_config_overrides := RemoteConfig.extract_cli_overrides(args):
+            overrides["remote_config"] = remote_config_overrides
+
+        return overrides
+
+    @staticmethod
+    def deep_merge(base: dict[str, Any], update: dict[str, Any]) -> None:
+        """Merge ``update`` into ``base`` in place: nested dicts recurse, all other values overwrite."""
+        for key, value in update.items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                Config.deep_merge(base[key], value)
+            else:
+                base[key] = value
+
+    @model_validator(mode="after")
+    def validate_config(self) -> "Config":
+        """Validate the configuration after initialization."""
+        # Ensure target_dir is always set and resolved (never None)
+        if self.target_dir is None:
+            from chunkhound.utils.project_detection import find_project_root
+
+            detected_root = find_project_root(None)
+            # Fallback to current working directory if no project root found
+            resolved_target = (
+                detected_root.resolve() if detected_root else Path.cwd().resolve()
+            )
+            # Use object.__setattr__ to avoid Pydantic validation recursion
+            object.__setattr__(self, "target_dir", resolved_target)
+        else:
+            # Ensure target_dir is resolved to canonical path (handles symlinks)
+            # Use object.__setattr__ to avoid Pydantic validation recursion
+            object.__setattr__(self, "target_dir", self.target_dir.resolve())
+
+        # Ensure the tracked config file paths are also resolved to canonical form.
+        # This handles Windows short names (8.3 like RUNNER~1), symlinks, and
+        # any differences in how temp dirs / constructed Paths are represented
+        # before vs after .resolve().
+        for field_name in ("local_config_file", "global_config_file", "config_file"):
+            val = getattr(self, field_name, None)
+            if val is not None:
+                try:
+                    object.__setattr__(self, field_name, val.resolve())
+                except Exception:
+                    # Best effort; leave as-is if resolve is not possible.
+                    pass
+
+        # Ensure database path is set
+        if not self.database.path:
+            # Try to detect project root from target_dir or auto-detect
+            from chunkhound.utils.project_detection import find_project_root
+
+            # Use the target_dir if it was provided during initialization
+            start_path = self.target_dir
+            project_root = find_project_root(start_path)
+
+            # Set default database path in project root
+            self.database.path = project_root / ".chunkhound" / "db"
+
+        # Ensure database path is resolved to canonical form (handles symlinks)
+        if self.database.path:
+            self.database.path = self.database.path.resolve()
+
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert configuration to dictionary."""
+        return self.model_dump(exclude_none=True)
+
+    @classmethod
+    def from_environment(cls) -> "Config":
+        """Construct Config using environment and defaults (no CLI args).
+
+        Convenience for legacy call sites expecting a simple way to obtain a
+        fully-initialized Config without command-specific CLI parsing.
+        """
+        return cls(args=None)
+
+    @classmethod
+    def snapshot_from_global_dict(cls, global_dict: dict[str, Any]) -> "Config":
+        """Build a snapshot Config whose global-JSON layer is ``global_dict``.
+
+        Applies env + provided global dict; skips local_config, config_file,
+        and CLI layers. Used by the remote-config pipeline for the pre-rules
+        half-merged snapshot that feeds rule predicates like ``when.existing``
+        — must reflect disk+env state, so CLI and local layers are excluded.
+        The delta gate uses ``snapshot_for_persisted_gate`` (the JSON that
+        would be written) and ``snapshot_for_delta_gate`` (the active
+        invocation) together; see those methods.
+        """
+        return cls(
+            args=None,
+            skip_layers={"local_config", "config_file", "cli"},
+            global_override=global_dict,
+        )
+
+    @classmethod
+    def snapshot_for_persisted_gate(cls, global_dict: dict[str, Any]) -> "Config":
+        """Build a snapshot of the on-disk global JSON alone.
+
+        Skips env, local, ``--config``, and CLI so a standing env var or a
+        one-off flag cannot mask a newly persisted hazard. This is one
+        substrate of the remote-config delta gate; the other is
+        ``snapshot_for_delta_gate`` (every layer of the current process).
+        Both must accept (``E_post ⊆ E_pre``) or the payload is discarded.
+
+        ``_hide_nested_basesettings_env`` is required because
+        ``EmbeddingConfig`` / ``LLMConfig`` / ``ResearchConfig`` /
+        ``FetchUrlConfig`` are ``pydantic_settings.BaseSettings`` and re-read
+        env vars inside their own constructors (both the special-handling
+        block and the ``default_factory`` path in ``super().__init__``),
+        defeating the outer ``skip_layers={"env"}`` alone.
+        """
+        with _hide_nested_basesettings_env():
+            return cls(
+                args=None,
+                skip_layers={"env", "local_config", "config_file", "cli"},
+                global_override=global_dict,
+            )
+
+    @classmethod
+    def snapshot_for_delta_gate(
+        cls, global_dict: dict[str, Any], args: Any
+    ) -> "Config":
+        """Build a snapshot merging every layer, with ``global_dict`` as global-JSON.
+
+        The *active-invocation* substrate of the remote-config delta gate.
+        Unlike ``snapshot_for_persisted_gate`` (the JSON that would be
+        written, overlays skipped), this view includes CLI flags,
+        ``--config``, and project-local ``.chunkhound.json`` so a rule
+        that is only unsafe in combination with the current process's
+        other sources still fails closed.
+
+        The pipeline ANDs this comparison with
+        ``snapshot_for_persisted_gate``: an overlay (e.g. ``--auth-token``)
+        must not mask a hazard that would appear in the file itself, and
+        a clean file must not mask a hazard that appears only when merged
+        with this invocation.
+
+        Each side also runs ``_hazard_snapshot_for_command`` so guards
+        keyed on runtime state (e.g. ``mcp.transport == "http"``) enumerate
+        even when no layer selects HTTP. The substitution is symmetric
+        across pre/post, so pre-existing accepted risk still passes
+        ``E_post ⊆ E_pre``.
+        """
+        return cls(args=args, global_override=global_dict)
+
+    def _hazard_snapshot_for_command(self, command: str) -> "Config":
+        """Return a snapshot forcing runtime-state-gated fields to their
+        worst case so all ``command`` guards enumerate under the delta gate.
+
+        Colocated with ``validate_for_command_structured`` in this class
+        so the substitution table stays in lockstep with the guards.
+        When adding a new guard gated on runtime state (e.g. ``if
+        command == "X" and self.foo.bar == Y``), extend this method with
+        the matching worst-case substitution — else the delta gate
+        short-circuits and a rule can persist the dangerous field.
+
+        Concrete scenario this defends against: a ``search`` invocation
+        with no HTTP transport anywhere (no CLI flag, no env, no on-disk
+        ``mcp.transport``) sees the ``mcp`` guard short-circuit — a rule
+        pushing ``mcp.host=0.0.0.0`` or ``mcp.cors=true`` lands on both
+        sides of the gate without ever emitting the hazard code, and the
+        next ``mcp --transport http`` startup then fails at final
+        validation. Forcing ``transport='http'`` here surfaces the
+        hazard at delta-gate time so the rule is rejected before persist.
+
+        Current substitutions:
+        - ``mcp``: force ``mcp.transport='http'`` so
+          ``MCP_NON_LOOPBACK_NO_AUTH`` / ``MCP_CORS_NO_AUTH`` fire even
+          when the active invocation resolves transport to ``stdio``.
+
+        Not for use outside the delta gate — production callers of
+        ``validate_for_command_structured`` need the real runtime state.
+        """
+        if command == "mcp" and self.mcp.transport != "http":
+            forced = self.model_copy(deep=True)
+            forced.mcp.transport = "http"
+            return forced
+        return self
+
+    def validate_for_command_structured(
+        self, command: str, args: Any | None = None
+    ) -> list[tuple[ConfigErrorCode, str]]:
+        """
+        Validate configuration for a specific command, returning structured codes.
+
+        Mirrors `validate_for_command` branch-for-branch, pairing each error
+        message with a stable `ConfigErrorCode`. The remote-config terminal
+        delta gate uses the codes as a comparison key that is robust against
+        message-string wording changes.
+
+        Args:
+            command: Command name ('index', 'mcp', etc.)
+
+        Returns:
+            List of (code, message) tuples (empty if valid)
+        """
+        errors: list[tuple[ConfigErrorCode, str]] = []
+
+        # Check for missing configuration
+        missing_config = self.get_missing_config()
+        if missing_config:
+            errors.extend(
+                (
+                    ConfigErrorCode.MISSING_REQUIRED_CONFIG,
+                    f"Missing required configuration: {item}",
+                )
+                for item in missing_config
+            )
+
+        # websearch only spawns _quickresearch as a subprocess, but we validate
+        # LLM/embedding config in the parent so misconfiguration fails fast
+        # before fetching DDG results and writing tempfiles.
+        requires_llm = (
+            command in ("research", "websearch", "_quickresearch", "fetchurl")
+            or (command == "map" and not getattr(args, "overview_only", False))
+            or (command == "autodoc" and not getattr(args, "assets_only", False))
+        )
+        if requires_llm:
+            if self.llm is None:
+                errors.append(
+                    (ConfigErrorCode.LLM_NOT_CONFIGURED, "No LLM provider configured")
+                )
+            else:
+                llm_roles = ["utility", "synthesis"]
+                if command == "map" and (
+                    self.llm.map_hyde_provider
+                    or self.llm.map_hyde_model
+                    or self.llm.map_hyde_reasoning_effort
+                ):
+                    llm_roles.append("map_hyde")
+                if command == "autodoc":
+                    llm_roles.append("autodoc_cleanup")
+
+                llm_missing = self.llm.get_missing_config_for_roles(tuple(llm_roles))
+                if llm_missing:
+                    errors.extend(
+                        (
+                            ConfigErrorCode.LLM_MISSING_ROLE_CONFIG,
+                            f"Missing required configuration: llm.{item}",
+                        )
+                        for item in llm_missing
+                    )
+
+        # Validate embedding provider requirements for commands that index code
+        if command in ("index", "websearch", "_quickresearch"):
+            # Skip embedding validation if embeddings were explicitly disabled
+            if not self.embeddings_disabled:
+                if self.embedding is None:
+                    errors.append(
+                        (
+                            ConfigErrorCode.EMBEDDING_NOT_CONFIGURED,
+                            "No embedding provider configured",
+                        )
+                    )
+                elif self.embedding and not self.embedding.is_provider_configured():
+                    errors.append(
+                        (
+                            ConfigErrorCode.EMBEDDING_NOT_CONFIGURED,
+                            "Embedding provider not properly configured",
+                        )
+                    )
+
+        # For MCP command, embedding is optional
+        elif command == "mcp":
+            if self.embedding and not self.embedding.is_provider_configured():
+                errors.append(
+                    (
+                        ConfigErrorCode.EMBEDDING_NOT_CONFIGURED,
+                        "Embedding provider not properly configured",
+                    )
+                )
+
+        # For search command, embedding is optional but must be valid if present
+        elif command == "search":
+            if self.embedding and not self.embedding.is_provider_configured():
+                errors.append(
+                    (
+                        ConfigErrorCode.EMBEDDING_NOT_CONFIGURED,
+                        "Embedding provider not properly configured",
+                    )
+                )
+
+        # New runtime-state-gated `mcp` hazards must also be enumerated in
+        # `_hazard_snapshot_for_command` above — else the remote-config delta
+        # gate short-circuits and a rule can persist the dangerous field.
+        if command == "mcp" and self.mcp.transport == "http":
+            if not is_loopback_host(self.mcp.host) and not self.mcp.auth_token:
+                errors.append(
+                    (
+                        ConfigErrorCode.MCP_NON_LOOPBACK_NO_AUTH,
+                        "mcp.host is non-loopback but no auth_token is set. Binding "
+                        "the HTTP transport to a non-localhost address without "
+                        "--auth-token is refused. Set --auth-token, or omit --host "
+                        "to bind to 127.0.0.1 (default).",
+                    )
+                )
+            if self.mcp.cors and not self.mcp.auth_token:
+                errors.append(
+                    (
+                        ConfigErrorCode.MCP_CORS_NO_AUTH,
+                        "mcp.cors is enabled but no auth_token is set. Enabling CORS "
+                        "without --auth-token lets any website open in the same "
+                        "browser read from the HTTP transport, even on a loopback "
+                        "host. Set --auth-token, or omit --cors.",
+                    )
+                )
+
+        if self.database.read_only:
+            # _quickresearch always uses a :memory: DB (see quickresearch.py),
+            # so a project-level read_only setting inherited via --config is
+            # structurally inapplicable — accept it here and let the connection
+            # manager drop read_only for :memory: paths.
+            if command not in ("mcp", "_quickresearch"):
+                errors.append(
+                    (
+                        ConfigErrorCode.DB_READONLY_WRONG_COMMAND,
+                        "database.read_only=True is only valid for the 'mcp' "
+                        "subcommand",
+                    )
+                )
+            elif command == "mcp" and self.database.provider != "duckdb":
+                errors.append(
+                    (
+                        ConfigErrorCode.DB_READONLY_NON_DUCKDB,
+                        "database.read_only=True is only supported with the DuckDB "
+                        f"provider (got '{self.database.provider}'). "
+                        "Use the DuckDB provider, or omit --read-only.",
+                    )
+                )
+
+        return errors
+
+    def validate_for_command(self, command: str, args: Any | None = None) -> list[str]:
+        """
+        Validate configuration for a specific command.
+
+        Args:
+            command: Command name ('index', 'mcp', etc.)
+
+        Returns:
+            List of validation errors (empty if valid)
+        """
+        return [msg for _, msg in self.validate_for_command_structured(command, args)]
+
+    def get_missing_config(self) -> list[str]:
+        """
+        Get list of missing required configuration parameters.
+
+        Returns:
+            List of missing configuration parameter names
+        """
+        missing = []
+
+        # Check embedding configuration if it exists
+        if self.embedding:
+            if hasattr(self.embedding, "get_missing_config"):
+                embedding_missing = self.embedding.get_missing_config()
+                for item in embedding_missing:
+                    missing.append(f"embedding.{item}")
+        # Note: If embedding is None, we don't assume a default provider
+        # Commands like index and search can work without embeddings
+
+        return missing
+
+    def is_fully_configured(self) -> bool:
+        """
+        Check if all required configuration is present.
+
+        Returns:
+            True if fully configured, False otherwise
+        """
+        return self.embedding is not None and self.embedding.is_provider_configured()

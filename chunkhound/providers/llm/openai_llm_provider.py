@@ -1,0 +1,528 @@
+"""OpenAI LLM provider implementation for ChunkHound deep research."""
+
+import json
+import os
+from typing import Any
+
+from loguru import logger
+
+from chunkhound.core import analytics as ch_analytics
+from chunkhound.core.config.llm_config import DEFAULT_LLM_TIMEOUT
+from chunkhound.core.utils.openai_utils import is_official_openai_endpoint
+from chunkhound.interfaces.llm_provider import (
+    LLMResponse,
+    OutputLimitCapability,
+    OutputLimitIntent,
+    OutputLimitMetadata,
+)
+from chunkhound.providers.llm.openai_compatible_provider import OpenAICompatibleProvider
+from chunkhound.utils.json_extraction import build_schema_system_instruction
+
+
+class OpenAILLMProvider(OpenAICompatibleProvider):
+    """OpenAI LLM provider using GPT models.
+
+    Supports both Chat Completions API and Responses API:
+    - Chat Completions (/v1/chat/completions): Standard models
+    - Responses API (/v1/responses): Newer models with agentic capabilities
+
+    Strategy: Prefer Responses API for all compatible models
+    (it's a superset of Chat Completions)
+    """
+
+    # Models that ONLY support Responses API (from OpenAI spec: ResponsesOnlyModel)
+    # These models will fail if you try to use Chat Completions API
+    RESPONSES_ONLY_MODELS = {
+        "o1-pro",
+        "o3-pro",
+        "o3-deep-research",
+        "o4-mini-deep-research",
+        "computer-use-preview",
+        "gpt-5-codex",
+        "gpt-5-pro",
+    }
+
+    # Models that support both APIs but Responses is preferred (from OpenAI spec + docs)
+    # Responses API is a superset with agentic capabilities
+    RESPONSES_PREFERRED_MODELS = {
+        # GPT-5 series (all support Responses)
+        "gpt-5.1",
+        "gpt-5.1-codex",  # Also in RESPONSES_ONLY but safe to have both
+        "gpt-5.1-mini",
+        "gpt-5",
+        "gpt-5-mini",
+        "gpt-5-nano",
+        # GPT-4.1 series
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        # GPT-4o series
+        "gpt-4o",
+        "gpt-4o-mini",
+        # o-series reasoning models
+        "o1",
+        "o1-preview",
+        "o1-mini",
+        "o3",
+        "o3-mini",
+        "o4-mini",
+    }
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = "gpt-5-nano-mini",
+        base_url: str | None = None,
+        ssl_verify: bool = True,
+        timeout: int = DEFAULT_LLM_TIMEOUT,
+        max_retries: int = 3,
+        reasoning_effort: str | None = None,
+        supports_structured_outputs: bool | None = None,
+    ):
+        """Initialize OpenAI LLM provider.
+
+        Args:
+            api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
+            model: Model name to use
+            base_url: Base URL for OpenAI API (optional for custom endpoints)
+            ssl_verify: Verify TLS certificates for requests sent via base_url
+            timeout: Request timeout in seconds
+            max_retries: Number of retry attempts for failed requests
+            reasoning_effort: Reasoning effort for reasoning models
+                (none, minimal, low, medium, high)
+            supports_structured_outputs: Override class-level structured
+                output support flag
+        """
+        # Resolve the selected route once so capability metadata and SDK
+        # construction cannot disagree about an environment-provided endpoint.
+        resolved_base_url = base_url or os.getenv("OPENAI_BASE_URL")
+        self._uses_custom_endpoint = not is_official_openai_endpoint(
+            resolved_base_url
+        )
+        super().__init__(
+            api_key=api_key,
+            model=model,
+            base_url=resolved_base_url,
+            ssl_verify=ssl_verify,
+            timeout=timeout,
+            max_retries=max_retries,
+            supports_structured_outputs=supports_structured_outputs,
+            reasoning_effort=reasoning_effort,
+        )
+
+    @property
+    def output_limit_metadata(self) -> OutputLimitMetadata:
+        """Official OpenAI supports omission; custom endpoints remain unknown."""
+        capability = (
+            OutputLimitCapability.UNKNOWN
+            if self._uses_custom_endpoint
+            else OutputLimitCapability.SUPPORTED
+        )
+        return OutputLimitMetadata(omission=capability)
+
+    def _get_default_base_url(self) -> str | None:
+        """Get the default OpenAI API base URL.
+
+        Returns None so AsyncOpenAI falls back to its official default when no
+        explicit or OPENAI_BASE_URL route was selected during construction.
+        """
+        return None
+
+    def _get_provider_name(self) -> str:
+        """Get the provider name."""
+        return "openai"
+
+    def _should_use_responses_api(self) -> bool:
+        """Check if the model should use Responses API instead of Chat Completions.
+
+        Returns:
+            True if model should use /v1/responses endpoint
+        """
+        # Check exact matches against Responses-only models (MUST use Responses)
+        if self._model in self.RESPONSES_ONLY_MODELS:
+            return True
+
+        # Check exact matches against Responses-preferred models (SHOULD use Responses)
+        if self._model in self.RESPONSES_PREFERRED_MODELS:
+            return True
+
+        # Check prefixes for dated model snapshots (e.g., "gpt-5.1-2025-11-13")
+        all_responses_models = (
+            self.RESPONSES_ONLY_MODELS | self.RESPONSES_PREFERRED_MODELS
+        )
+        for base_model in all_responses_models:
+            if self._model.startswith(base_model + "-"):
+                return True
+
+        return False
+
+    async def _create_response(self, **kwargs: Any) -> Any:
+        """Single instrumented chokepoint for responses.create(), used by
+        every Responses API caller. Retries are SDK-internal (max_retries=
+        on the client): one call here can trigger several real HTTP
+        attempts that never surface individually, so record_provider_call
+        counts the outcome after the SDK's retry budget is exhausted, not
+        per-HTTP-attempt. A transient failure the SDK silently retries past
+        never appears in analytics -- mirrors
+        OpenAICompatibleProvider._create_chat_completion for the Chat
+        Completions API, and differs from the embedding/rerank providers,
+        which record one call per real manual-retry-loop attempt."""
+        try:
+            response = await self._client.responses.create(**kwargs)
+        except Exception as exc:
+            ch_analytics.record_provider_call(
+                "llm", self.name, self._model, False, error_type=type(exc).__name__
+            )
+            raise
+        ch_analytics.record_provider_call(
+            "llm",
+            self.name,
+            self._model,
+            True,
+            input_tokens=response.usage.input_tokens if response.usage else None,
+            output_tokens=response.usage.output_tokens if response.usage else None,
+        )
+        return response
+
+    async def _complete_with_responses_api(
+        self,
+        prompt: str,
+        system: str | None = None,
+        max_completion_tokens: int | OutputLimitIntent = 4096,
+        timeout: int | None = None,
+    ) -> LLMResponse:
+        """Generate a completion using the Responses API for reasoning models.
+
+        Args:
+            prompt: The user prompt
+            system: Optional system/developer message
+            max_completion_tokens: Maximum tokens to generate
+            timeout: Optional timeout in seconds (overrides default)
+
+        Returns:
+            LLMResponse with content and metadata
+        """
+        resolved_max_tokens = self.resolve_synthesis_output_limit(
+            max_completion_tokens
+        ).max_tokens
+        request_timeout = timeout if timeout is not None else self._timeout
+
+        # Build request parameters for Responses API
+        request_params: dict[str, Any] = {
+            "model": self._model,
+            "input": prompt,  # Responses API uses 'input' instead of 'messages'
+            "timeout": request_timeout,
+        }
+        if resolved_max_tokens is not None:
+            request_params["max_output_tokens"] = resolved_max_tokens
+
+        # Add system instructions if provided
+        if system:
+            request_params["instructions"] = system
+
+        # Add reasoning configuration if specified
+        if self._reasoning_effort:
+            request_params["reasoning"] = {"effort": self._reasoning_effort}
+
+        try:
+            # Call Responses API
+            response = await self._create_response(**request_params)
+
+            self._requests_made += 1
+            if response.usage:
+                # Responses API uses input_tokens/output_tokens instead of
+                # prompt_tokens/completion_tokens
+                self._prompt_tokens += response.usage.input_tokens
+                self._completion_tokens += response.usage.output_tokens
+                self._tokens_used += response.usage.total_tokens
+
+            # Extract response content from output items
+            content_parts = []
+            for item in response.output:
+                if item.type == "message":
+                    # Message item contains the actual response text
+                    for content_item in item.content:
+                        # Responses API uses "output_text" type
+                        if content_item.type == "output_text" and hasattr(
+                            content_item, "text"
+                        ):
+                            content_parts.append(content_item.text)
+
+            content = "\n".join(content_parts) if content_parts else None
+
+            tokens = response.usage.total_tokens if response.usage else 0
+            finish_reason = (
+                response.status
+            )  # Responses API uses 'status' instead of 'finish_reason'
+
+            # Check for incomplete responses FIRST (fix C2) so provider
+            # diagnostics are not masked by a generic empty-content error.
+            if finish_reason == "incomplete":
+                incomplete_details = getattr(response, "incomplete_details", None)
+                incomplete_reason = getattr(incomplete_details, "reason", None)
+                if incomplete_reason == "max_output_tokens":
+                    usage_info = ""
+                    if response.usage:
+                        usage_info = (
+                            f" (input={response.usage.input_tokens:,}, "
+                            f"output={response.usage.output_tokens:,})"
+                        )
+
+                    raise RuntimeError(
+                        "LLM response incomplete - token limit exceeded"
+                        f"{usage_info}. For reasoning models, this indicates the "
+                        "query requires extensive reasoning that exhausted the output "
+                        "budget. Try breaking your query into smaller, more focused "
+                        "questions."
+                    )
+
+                raise RuntimeError(
+                    "LLM response incomplete "
+                    f"(reason={incomplete_reason or 'unknown'})"
+                )
+
+            # Validate content is not None or empty (reached only if not incomplete)
+            if content is None:
+                logger.error(
+                    f"OpenAI Responses API returned None content "
+                    f"(status={finish_reason}, tokens={tokens})"
+                )
+                raise RuntimeError(
+                    f"LLM returned empty response (status={finish_reason}). "
+                    "This may indicate a content filter, API error, or model refusal."
+                )
+
+            if not content.strip():
+                logger.warning(
+                    f"OpenAI Responses API returned empty content "
+                    f"(status={finish_reason}, tokens={tokens})"
+                )
+                raise RuntimeError(
+                    f"LLM returned empty response (status={finish_reason}). "
+                    "This may indicate a content filter, API error, or model refusal."
+                )
+
+            # Warn on other unexpected status
+            if finish_reason not in ("completed", "complete"):
+                logger.warning(
+                    f"Unexpected status: {finish_reason} "
+                    f"(content_length={len(content)})"
+                )
+
+            return LLMResponse(
+                content=content,
+                tokens_used=tokens,
+                model=self._model,
+                finish_reason=finish_reason,
+            )
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.error(f"OpenAI Responses API completion failed: {e}")
+            raise RuntimeError(f"LLM completion failed: {e}") from e
+
+    async def complete(
+        self,
+        prompt: str,
+        system: str | None = None,
+        max_completion_tokens: int | OutputLimitIntent = 4096,
+        timeout: int | None = None,
+    ) -> LLMResponse:
+        """Generate a completion for the given prompt.
+
+        Automatically routes to the appropriate API:
+        - Responses API for reasoning models (gpt-5.1, o-series, etc.)
+        - Chat Completions API for standard models
+
+        Args:
+            prompt: The user prompt
+            system: Optional system prompt
+            max_completion_tokens: Maximum tokens to generate
+            timeout: Optional timeout in seconds (overrides default)
+        """
+        # Route to Responses API for compatible models
+        if self._should_use_responses_api():
+            logger.debug(f"Using Responses API for model: {self._model}")
+            return await self._complete_with_responses_api(
+                prompt, system, max_completion_tokens, timeout
+            )
+
+        # Use Chat Completions API for standard models via parent implementation
+        return await super().complete(prompt, system, max_completion_tokens, timeout)
+
+    async def _complete_structured_with_responses_api(
+        self,
+        prompt: str,
+        json_schema: dict[str, Any],
+        system: str | None = None,
+        max_completion_tokens: int | OutputLimitIntent = 4096,
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        """Generate structured JSON using Responses API.
+
+        Uses native ``text.format`` with ``json_schema`` when
+        ``_supports_structured_outputs`` is ``True``. Otherwise falls back
+        to prompt-based schema injection while keeping Responses API routing.
+
+        Args:
+            prompt: The user prompt
+            json_schema: JSON Schema definition for structured output
+            system: Optional system/developer message
+            max_completion_tokens: Maximum tokens to generate
+            timeout: Optional timeout in seconds (overrides default)
+
+        Returns:
+            Parsed JSON object conforming to schema
+        """
+        resolved_max_tokens = self.resolve_synthesis_output_limit(
+            max_completion_tokens
+        ).max_tokens
+        request_timeout = timeout if timeout is not None else self._timeout
+
+        # Build request parameters for Responses API structured output
+        request_params: dict[str, Any] = {
+            "model": self._model,
+            "input": prompt,
+            "timeout": request_timeout,
+        }
+        if resolved_max_tokens is not None:
+            request_params["max_output_tokens"] = resolved_max_tokens
+
+        if self._supports_structured_outputs:
+            # Responses API uses text.format for native structured outputs.
+            request_params["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "structured_response",
+                    "strict": True,
+                    "schema": json_schema,
+                }
+            }
+        else:
+            schema_instruction = build_schema_system_instruction(json_schema)
+            if system:
+                effective_system = f"{system}\n\n{schema_instruction}"
+            else:
+                effective_system = schema_instruction
+
+            request_params["instructions"] = effective_system
+
+        # Add system instructions if provided (native path)
+        if self._supports_structured_outputs and system:
+            request_params["instructions"] = system
+
+        # Add reasoning configuration if specified
+        if self._reasoning_effort:
+            request_params["reasoning"] = {"effort": self._reasoning_effort}
+
+        try:
+            response = await self._create_response(**request_params)
+
+            self._requests_made += 1
+            if response.usage:
+                self._prompt_tokens += response.usage.input_tokens
+                self._completion_tokens += response.usage.output_tokens
+                self._tokens_used += response.usage.total_tokens
+
+            # Extract JSON content from output items
+            content_parts = []
+            for item in response.output:
+                if item.type == "message":
+                    for content_item in item.content:
+                        if content_item.type == "output_text" and hasattr(
+                            content_item, "text"
+                        ):
+                            content_parts.append(content_item.text)
+
+            content = "\n".join(content_parts) if content_parts else None
+            finish_reason = response.status
+
+            # Check for incomplete responses before empty-content validation so
+            # provider diagnostics are not masked by a generic empty error.
+            if finish_reason == "incomplete":
+                incomplete_details = getattr(response, "incomplete_details", None)
+                incomplete_reason = getattr(incomplete_details, "reason", None)
+                if incomplete_reason == "max_output_tokens":
+                    usage_info = ""
+                    if response.usage:
+                        usage_info = (
+                            f" (input={response.usage.input_tokens:,}, "
+                            f"output={response.usage.output_tokens:,})"
+                        )
+                    raise RuntimeError(
+                        "LLM structured completion incomplete - token limit "
+                        f"exceeded{usage_info}"
+                    )
+
+                raise RuntimeError(
+                    "LLM structured completion incomplete "
+                    f"(reason={incomplete_reason or 'unknown'})"
+                )
+
+            # Validate content
+            if content is None or not content.strip():
+                logger.error(
+                    f"Responses API structured output returned empty content "
+                    f"(status={finish_reason})"
+                )
+                raise RuntimeError(
+                    f"LLM structured output returned empty response "
+                    f"(status={finish_reason})"
+                )
+
+            # Parse JSON
+            parsed = self._parse_structured_response(content, json_schema)
+            return parsed
+
+        except json.JSONDecodeError as e:
+            logger.error(
+                f"Failed to parse Responses API structured output as JSON: {e}"
+            )
+            raise RuntimeError(f"Invalid JSON in structured output: {e}") from e
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.error(f"Responses API structured completion failed: {e}")
+            raise RuntimeError(f"LLM structured completion failed: {e}") from e
+
+    async def complete_structured(
+        self,
+        prompt: str,
+        json_schema: dict[str, Any],
+        system: str | None = None,
+        max_completion_tokens: int | OutputLimitIntent = 4096,
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        """Generate a structured JSON completion conforming to the given schema.
+
+        Automatically routes to the appropriate API:
+        - Responses API for reasoning models (gpt-5.1, o-series, etc.)
+        - Chat Completions API for standard models
+
+        Uses OpenAI's structured outputs with strict JSON Schema validation.
+        Best practice for GPT-5-Nano: Guarantees valid, parseable JSON output.
+
+        Args:
+            prompt: The user prompt
+            json_schema: JSON Schema definition for structured output
+            system: Optional system prompt
+            max_completion_tokens: Maximum tokens to generate
+            timeout: Optional timeout in seconds (overrides default)
+
+        Returns:
+            Parsed JSON object conforming to schema
+        """
+        # Route to Responses API for compatible models
+        if self._should_use_responses_api():
+            logger.debug(
+                f"Using Responses API for structured output with model: {self._model}"
+            )
+            return await self._complete_structured_with_responses_api(
+                prompt, json_schema, system, max_completion_tokens, timeout
+            )
+
+        # Use Chat Completions API for standard models via parent implementation
+        return await super().complete_structured(
+            prompt, json_schema, system, max_completion_tokens, timeout
+        )

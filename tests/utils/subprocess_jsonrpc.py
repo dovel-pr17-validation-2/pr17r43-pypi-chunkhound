@@ -1,0 +1,350 @@
+"""Robust JSON-RPC subprocess communication helper.
+
+This module provides a deadlock-free JSON-RPC client for subprocess communication
+following asyncio best practices. It uses a background reader task pattern to avoid
+the common deadlock issues that occur when mixing stdin.write() with stdout.readline().
+
+Key features:
+- Background reader task for non-blocking stdout reading
+- Request/response matching by JSON-RPC ID
+- Per-request timeout handling
+- Graceful error handling for subprocess crashes and malformed JSON
+- Clean shutdown with proper task cancellation
+
+See: https://docs.python.org/3/library/asyncio-subprocess.html#asyncio-subprocess-streams
+"""
+
+import asyncio
+import json
+import logging
+from typing import Any, cast
+
+from .jsonrpc_envelope import (
+    JsonRpcResponseError,
+    JsonRpcTimeoutError,
+    McpClientError,
+    SubprocessCrashError,
+    SubprocessJsonRpcError,
+    build_notification,
+    build_request,
+    unwrap_result,
+)
+
+logger = logging.getLogger(__name__)
+
+# Re-exported for backwards compatibility — these used to be defined here;
+# callers still import them from this module (see tests/utils/__init__.py).
+# ``SubprocessJsonRpcError`` is an alias for ``McpClientError`` (see
+# jsonrpc_envelope.py) kept so existing imports of the old name keep working.
+__all__ = [
+    "McpClientError",
+    "SubprocessJsonRpcError",
+    "SubprocessCrashError",
+    "JsonRpcTimeoutError",
+    "JsonRpcResponseError",
+    "SubprocessJsonRpcClient",
+]
+
+
+class SubprocessJsonRpcClient:
+    """Robust JSON-RPC client for subprocess communication.
+
+    This class implements a deadlock-free pattern for JSON-RPC communication
+    with a subprocess using a background reader task that continuously reads
+    from stdout and queues responses for retrieval.
+
+    Example usage:
+        proc = await asyncio.create_subprocess_exec(
+            "uv", "run", "chunkhound", "mcp", "stdio",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        client = SubprocessJsonRpcClient(proc)
+        await client.start()
+
+        try:
+            response = await client.send_request(
+                "initialize",
+                {"protocolVersion": "2024-11-05"},
+                timeout=5.0
+            )
+            await client.send_notification("initialized", {})
+            result = await client.send_request(
+                "tools/call",
+                {"name": "search_regex", "arguments": {"pattern": "hello"}}
+            )
+        finally:
+            await client.close()
+    """
+
+    def __init__(self, process: asyncio.subprocess.Process):
+        """Initialize the JSON-RPC client.
+
+        Args:
+            process: The subprocess to communicate with. Must have stdin and
+                stdout pipes.
+
+        Raises:
+            ValueError: If process doesn't have stdin or stdout pipes.
+        """
+        if process.stdin is None:
+            raise ValueError("Process must have stdin pipe")
+        if process.stdout is None:
+            raise ValueError("Process must have stdout pipe")
+
+        self._process = process
+        self._reader_task: asyncio.Task[None] | None = None
+        self._pending_requests: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self._request_id_lock = asyncio.Lock()
+        self._next_request_id = 1
+        self._closed = False
+
+    async def start(self) -> None:
+        """Start the background reader task.
+
+        This must be called before sending any requests.
+        """
+        if self._reader_task is not None:
+            raise RuntimeError("Client already started")
+
+        self._reader_task = asyncio.create_task(self._read_responses())
+
+    async def send_request(
+        self, method: str, params: dict[str, Any] | None = None, timeout: float = 5.0
+    ) -> dict[str, Any]:
+        """Send a JSON-RPC request and wait for the response.
+
+        Args:
+            method: The JSON-RPC method name.
+            params: The method parameters (optional).
+            timeout: Maximum time to wait for response in seconds.
+
+        Returns:
+            The JSON-RPC result object.
+
+        Raises:
+            JsonRpcTimeoutError: If the request times out.
+            JsonRpcResponseError: If the response contains an error.
+            SubprocessCrashError: If the subprocess terminates unexpectedly.
+            RuntimeError: If the client is not started or is closed.
+        """
+        if self._reader_task is None:
+            raise RuntimeError("Client not started - call start() first")
+        if self._closed:
+            raise RuntimeError("Client is closed")
+
+        # Generate unique request ID (async-safe)
+        async with self._request_id_lock:
+            request_id = self._next_request_id
+            self._next_request_id += 1
+
+        # Create future for response
+        response_future: asyncio.Future[dict[str, Any]] = asyncio.Future()
+        self._pending_requests[request_id] = response_future
+
+        request = build_request(method, params, request_id)
+
+        try:
+            request_json = json.dumps(request) + "\n"
+            # stdin is guaranteed to exist by __init__ check
+            assert self._process.stdin is not None
+            self._process.stdin.write(request_json.encode("utf-8"))
+            try:
+                await self._process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError) as e:
+                # Subprocess crashed before we could send
+                raise SubprocessCrashError(
+                    f"Subprocess crashed during request send: {e}"
+                ) from e
+
+            # Wait for response with timeout
+            try:
+                response = await asyncio.wait_for(response_future, timeout=timeout)
+            except asyncio.TimeoutError:
+                # Clean up pending request
+                self._pending_requests.pop(request_id, None)
+                raise JsonRpcTimeoutError(
+                    f"Request {method} (id={request_id}) timed out after {timeout}s"
+                )
+
+            return cast(dict[str, Any], unwrap_result(response, method))
+
+        except Exception:
+            # Clean up pending request on any error
+            self._pending_requests.pop(request_id, None)
+            raise
+
+    async def send_notification(
+        self, method: str, params: dict[str, Any] | None = None
+    ) -> None:
+        """Send a JSON-RPC notification (no response expected).
+
+        Args:
+            method: The JSON-RPC method name.
+            params: The method parameters (optional).
+
+        Raises:
+            RuntimeError: If the client is not started or is closed.
+        """
+        if self._reader_task is None:
+            raise RuntimeError("Client not started - call start() first")
+        if self._closed:
+            raise RuntimeError("Client is closed")
+
+        notification = build_notification(method, params)
+        notification_json = json.dumps(notification) + "\n"
+        # stdin is guaranteed to exist by __init__ check
+        assert self._process.stdin is not None
+        self._process.stdin.write(notification_json.encode("utf-8"))
+        try:
+            await self._process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError) as e:
+            # Subprocess crashed before we could send
+            raise SubprocessCrashError(
+                f"Subprocess crashed during notification send: {e}"
+            ) from e
+
+    async def close(self) -> None:
+        """Clean shutdown of the client and subprocess.
+
+        This terminates the subprocess, waits for the reader task to drain
+        stdout naturally, and ensures all resources are properly cleaned up.
+
+        Order matters on Windows (ProactorEventLoop / IOCP):
+        - Stdin must be closed before the subprocess is terminated so the
+          pipe transport is released cleanly.
+        - The subprocess must exit *before* the reader task is cancelled.
+          Cancelling the reader while an IOCP ReadFile is still pending leaves
+          an orphaned kernel operation; when the event loop later closes, the
+          _ProactorBasePipeTransport.__del__ raises ValueError which Python 3.11
+          converts to a spurious KeyboardInterrupt (asyncio/runners.py:123).
+        - After the process exits the pipe is broken, readline() returns b""
+          (EOF), and the reader task exits naturally — properly completing the
+          IOCP operation before the event loop is torn down.
+        """
+        if self._closed:
+            return
+
+        self._closed = True
+
+        # Cancel all pending requests
+        for future in self._pending_requests.values():
+            if not future.done():
+                future.cancel()
+        self._pending_requests.clear()
+
+        # Close stdin first so the subprocess sees EOF and can begin exiting.
+        # This also releases the stdin pipe transport before the loop closes.
+        if self._process.stdin is not None:
+            try:
+                self._process.stdin.close()
+                await self._process.stdin.wait_closed()
+            except Exception:
+                pass
+
+        # Terminate the subprocess so the stdout pipe gets broken (EOF).
+        if self._process.returncode is None:
+            self._process.terminate()
+            try:
+                await asyncio.wait_for(self._process.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning("Subprocess didn't terminate, killing it")
+                self._process.kill()
+                await self._process.wait()
+
+        # Now wait for the reader task to exit naturally.  The process has
+        # exited, so the stdout pipe is broken; the pending IOCP ReadFile will
+        # complete with EOF, readline() will return b"", and _read_responses()
+        # will break its loop and finish.  This lets the ProactorEventLoop
+        # process the IOCP completion *before* the event loop is closed,
+        # avoiding the _ProactorBasePipeTransport.__del__ KeyboardInterrupt.
+        if self._reader_task is not None:
+            try:
+                await asyncio.wait_for(self._reader_task, timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
+                # Fallback: forcibly cancel if it didn't drain in time.
+                self._reader_task.cancel()
+                try:
+                    await self._reader_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._reader_task = None
+
+    async def _read_responses(self) -> None:
+        """Background task that continuously reads responses from stdout.
+
+        This task runs until cancelled or the subprocess terminates.
+        It reads JSON-RPC responses and matches them to pending requests.
+        """
+        try:
+            # stdout is guaranteed to exist by __init__ check
+            assert self._process.stdout is not None
+
+            while True:
+                # Read line from stdout
+                try:
+                    line_bytes = await self._process.stdout.readline()
+                except Exception as e:
+                    logger.error(f"Error reading from subprocess: {e}")
+                    break
+
+                # Check if subprocess terminated
+                if not line_bytes:
+                    # EOF - subprocess terminated
+                    self._handle_subprocess_terminated()
+                    break
+
+                # Parse JSON response
+                try:
+                    line = line_bytes.decode("utf-8").strip()
+                    if not line:
+                        continue
+
+                    response = json.loads(line)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse JSON response: {line_bytes!r} - {e}")
+                    continue
+                except Exception as e:
+                    logger.error(f"Error processing response: {e}")
+                    continue
+
+                # Match response to pending request
+                if "id" in response:
+                    request_id = response["id"]
+                    future = self._pending_requests.pop(request_id, None)
+
+                    if future is not None and not future.done():
+                        future.set_result(response)
+                    else:
+                        logger.warning(
+                            "Received response for unknown or completed "
+                            f"request id={request_id}"
+                        )
+                else:
+                    # Notification or other message without id
+                    logger.debug(f"Received notification: {response}")
+
+        except asyncio.CancelledError:
+            # Expected during shutdown
+            pass
+        except Exception as e:
+            logger.error(f"Reader task crashed: {e}", exc_info=True)
+            self._handle_subprocess_terminated()
+
+    def _handle_subprocess_terminated(self) -> None:
+        """Handle unexpected subprocess termination.
+
+        This fails all pending requests with SubprocessCrashError.
+        """
+        error = SubprocessCrashError(
+            "Subprocess terminated unexpectedly "
+            f"(exit code: {self._process.returncode})"
+        )
+
+        for future in self._pending_requests.values():
+            if not future.done():
+                future.set_exception(error)
+
+        self._pending_requests.clear()

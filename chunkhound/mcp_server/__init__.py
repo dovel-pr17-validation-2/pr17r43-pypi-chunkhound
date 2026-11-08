@@ -1,0 +1,53 @@
+"""Lightweight MCP package initializer with lazy imports.
+
+Avoid importing heavy transport dependencies (e.g., MCP SDK) at import
+time to prevent environment-specific failures during test collection.
+Transport servers are resolved lazily either via getters or module-level
+__getattr__.
+"""
+
+from typing import TYPE_CHECKING
+
+from .base import MCPServerBase
+
+if TYPE_CHECKING:  # type checkers only; avoid runtime hard deps
+    from .http_server import HttpMCPServer as _HttpMCPServer  # noqa: F401
+    from .stdio import StdioMCPServer as _StdioMCPServer  # noqa: F401
+
+
+def get_stdio_server_class():
+    """Return the stdio MCP server class with a lazy import."""
+    from .stdio import StdioMCPServer
+
+    return StdioMCPServer
+
+
+def get_http_server_class():
+    """Return the HTTP MCP server class with a lazy import."""
+    from .http_server import HttpMCPServer
+
+    return HttpMCPServer
+
+
+def __getattr__(name: str):  # PEP 562: lazy attribute access on module
+    if name == "StdioMCPServer":
+        return get_stdio_server_class()
+    if name == "HttpMCPServer":
+        return get_http_server_class()
+    if name == "TOOL_REGISTRY":
+        from .tools import TOOL_REGISTRY
+
+        return TOOL_REGISTRY
+    raise AttributeError(name)
+
+
+__all__ = [
+    "MCPServerBase",
+    "TOOL_REGISTRY",
+    # Legacy names resolved lazily for compatibility
+    "StdioMCPServer",
+    "HttpMCPServer",
+    # Explicit getters
+    "get_stdio_server_class",
+    "get_http_server_class",
+]

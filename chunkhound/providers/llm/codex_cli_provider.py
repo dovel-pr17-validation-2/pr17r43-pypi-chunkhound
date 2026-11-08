@@ -1,0 +1,841 @@
+"""Codex CLI LLM provider for ChunkHound.
+
+Wraps `codex exec` to run local-agent synthesis using the user's Codex
+credentials and configuration. Designed for the final synthesis step in
+code_research; keeps MCP stdio clean by never printing to stdout.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import functools
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from loguru import logger
+
+from chunkhound.core.config.llm_config import DEFAULT_LLM_TIMEOUT
+from chunkhound.providers.llm.base_cli_provider import (
+    BaseCLIProvider,
+    build_cli_argv,
+    is_windows_batch_shim,
+    kill_windows_process_tree,
+    resolve_cli_binary,
+    terminate_cli_process,
+)
+from chunkhound.utils.text_sanitization import sanitize_error_text
+
+# Default synthesis-grade reasoning model for Codex CLI.
+# Update here when OpenAI releases a newer synthesis model.
+# This is the single source of truth.
+# Use CHUNKHOUND_CODEX_DEFAULT_MODEL env var to override at runtime.
+CODEX_DEFAULT_SYNTHESIS_MODEL = "gpt-5.1-codex"
+
+
+class CodexCLIProvider(BaseCLIProvider):
+    """Provider that shells out to `codex exec`.
+
+    Notes
+    - Uses stdin to avoid argv length limits for large prompts.
+    - Defaults to an isolated, read-only, non-interactive run (no history).
+    - Never writes to stdout; only returns captured content to caller.
+    """
+
+    # Timeouts used in health checks (seconds)
+    VERSION_CHECK_TIMEOUT = 5
+    HEALTH_CHECK_TIMEOUT = 30
+
+    def __init__(
+        self,
+        api_key: str | None = None,  # Unused (CLI handles auth)
+        model: str = "codex",
+        base_url: str | None = None,  # Unused
+        timeout: int = DEFAULT_LLM_TIMEOUT,
+        max_retries: int = 3,
+        reasoning_effort: str | None = None,
+    ) -> None:
+        super().__init__(api_key, model, base_url, timeout, max_retries)
+        self._reasoning_effort = self._resolve_reasoning_effort(reasoning_effort)
+        # Model resolution is deferred to first use to avoid side effects during
+        # construction (subprocess calls for dynamic discovery).
+        self._resolved_model: str | None = None
+
+        if not self._codex_available():
+            logger.warning("Codex CLI not found in PATH (codex)")
+
+    # ----- Internals -----
+
+    def _get_base_codex_home(self) -> Path | None:
+        base = os.getenv("CODEX_HOME")
+        if base:
+            p = Path(base).expanduser()
+            return p if p.exists() else None
+        # Default location
+        default = Path.home() / ".codex"
+        return default if default.exists() else None
+
+    def _resolve_model_name(self, requested: str | None) -> str:
+        """Resolve requested model name to Codex CLI model identifier."""
+        resolved, _source = self.describe_model_resolution(requested)
+        return resolved
+
+    def _get_resolved_model(self) -> str:
+        """Return cached resolved model, computing it lazily on first call."""
+        if self._resolved_model is None:
+            self._resolved_model = self._resolve_model_name(self._model)
+        return self._resolved_model
+
+    @classmethod
+    def describe_model_resolution(cls, requested: str | None) -> tuple[str, str]:
+        """Return (resolved_model, source) for Codex CLI model selection.
+
+        Notes:
+        - The special value "codex" means "discover the local Codex default".
+        - Override discovery via CHUNKHOUND_CODEX_DEFAULT_MODEL.
+        - If no env override, dynamically discovers the highest-priority available model
+          via `codex debug models`.
+        - If discovery fails, falls back to a static default so existing
+          configurations degrade gracefully.
+        """
+        env_override = os.getenv("CHUNKHOUND_CODEX_DEFAULT_MODEL")
+        if env_override:
+            return env_override.strip(), "env:CHUNKHOUND_CODEX_DEFAULT_MODEL"
+
+        model_name = (requested or "").strip()
+        if not model_name or model_name.lower() == "codex":
+            discovered = cls.get_highest_priority_available_model()
+            if discovered:
+                return discovered, "discovered"
+            # Static fallback so existing configs degrade gracefully when
+            # discovery fails (no codex binary, unauthenticated, etc.).
+            logger.warning(
+                "Codex model discovery failed; falling back to "
+                "%r. Check 'codex debug models' or "
+                "set CHUNKHOUND_CODEX_DEFAULT_MODEL.",
+                CODEX_DEFAULT_SYNTHESIS_MODEL,
+            )
+            return CODEX_DEFAULT_SYNTHESIS_MODEL, "fallback"
+
+        return model_name, "explicit"
+
+    def _resolve_reasoning_effort(self, requested: str | None) -> str:
+        """Resolve reasoning effort override."""
+        effort, _source = self.describe_reasoning_effort_resolution(requested)
+        return effort
+
+    @classmethod
+    def describe_reasoning_effort_resolution(
+        cls, requested: str | None
+    ) -> tuple[str, str]:
+        """Return (resolved_effort, source) for Codex CLI reasoning effort selection."""
+        env_override = os.getenv("CHUNKHOUND_CODEX_REASONING_EFFORT")
+        candidate = requested or env_override
+        allowed = {"minimal", "low", "medium", "high", "xhigh"}
+
+        if not candidate:
+            return "low", "default"
+
+        effort = candidate.strip().lower()
+        if effort not in allowed:
+            logger.warning(
+                "Unknown Codex reasoning effort '%s'; falling back to 'low'", candidate
+            )
+            return "low", "fallback"
+
+        if requested:
+            return effort, "explicit"
+        if env_override:
+            return effort, "env:CHUNKHOUND_CODEX_REASONING_EFFORT"
+        return effort, "default"
+
+    def _resolve_sandbox_mode(self, requested: str | None = None) -> str:
+        """Resolve sandbox mode for codex exec command execution."""
+        env_override = os.getenv("CHUNKHOUND_CODEX_SANDBOX_MODE")
+        candidate = (requested or env_override or "read-only").strip().lower()
+        allowed = {"read-only", "workspace-write", "danger-full-access"}
+        if candidate not in allowed:
+            logger.warning(
+                "Unknown Codex sandbox mode '%s'; falling back to 'read-only'",
+                candidate,
+            )
+            return "read-only"
+        return candidate
+
+    def _resolve_approval_policy(self, requested: str | None = None) -> str:
+        """Resolve approval policy for codex exec tool execution."""
+        env_override = os.getenv("CHUNKHOUND_CODEX_APPROVAL_POLICY")
+        # Default to on-request to discourage command execution in non-interactive runs.
+        candidate = (requested or env_override or "on-request").strip().lower()
+        allowed = {"untrusted", "on-failure", "on-request", "never"}
+        if candidate not in allowed:
+            logger.warning(
+                "Unknown Codex approval policy '%s'; falling back to 'on-request'",
+                candidate,
+            )
+            return "on-request"
+        return candidate
+
+    @staticmethod
+    def _toml_string(value: str) -> str:
+        # Codex parses `-c key=value` with TOML semantics. Use explicit strings to
+        # avoid ambiguity across CLI versions.
+        return '"' + value.replace('"', '\\"') + '"'
+
+    def _extract_agent_message_from_jsonl(
+        self, stdout_text: str
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """Extract final agent message text and usage from ``codex exec --json``."""
+        last_message: str | None = None
+        usage: dict[str, Any] | None = None
+
+        for line in stdout_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if obj.get("type") == "item.completed":
+                item = obj.get("item") or {}
+                if item.get("type") == "agent_message":
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        last_message = text
+            elif obj.get("type") == "turn.completed":
+                u = obj.get("usage")
+                if isinstance(u, dict):
+                    usage = u
+
+        return last_message, usage
+
+    def _copy_minimal_codex_state(self, base: Path, dest: Path) -> None:
+        """Copy minimal auth/session state into destination CODEX_HOME."""
+        copy_all = os.getenv("CHUNKHOUND_CODEX_COPY_ALL", "0") == "1"
+        max_bytes = int(os.getenv("CHUNKHOUND_CODEX_MAX_COPY_BYTES", "1000000"))
+
+        def _should_copy_dir(name: str) -> bool:
+            n = name.lower()
+            if copy_all:
+                return True
+            # Likely auth/session state we may need
+            return n in {"sessions", "session", "auth", "profiles", "state"}
+
+        def _should_copy_file(p: Path) -> bool:
+            if copy_all:
+                return True
+            if p.name.lower() == "config.toml":
+                return False  # we write our own config below
+            if p.suffix.lower() in {".json", ".toml", ".ini"}:
+                try:
+                    return p.stat().st_size <= max_bytes
+                except Exception:
+                    return False
+            return False
+
+        for item in base.iterdir():
+            dest_path = dest / item.name
+            try:
+                if item.is_dir():
+                    if _should_copy_dir(item.name):
+                        shutil.copytree(item, dest_path, dirs_exist_ok=False)
+                else:
+                    if _should_copy_file(item):
+                        shutil.copy2(item, dest_path)
+            except Exception:
+                # Best-effort copy; skip unreadable items
+                pass
+
+    def _build_overlay_home(self, model_override: str | None = None) -> str:
+        """Create an overlay CODEX_HOME inheriting auth but overriding config.
+
+        - Copies the base CODEX_HOME (if it exists) to a temp dir
+        - Replaces config.toml with a minimal one (no MCP, no history persistence)
+        - Sets fast model defaults (best effort)
+        - Copies only a minimal subset by default to reduce exposure
+        """
+        overlay = Path(tempfile.mkdtemp(prefix="chunkhound-codex-overlay-"))
+        base = self._get_base_codex_home()
+        model_name = (
+            self._resolve_model_name(model_override)
+            if model_override
+            else self._get_resolved_model()
+        )
+        try:
+            if base and base.exists():
+                self._copy_minimal_codex_state(base, overlay)
+
+            config_path = overlay / "config.toml"
+            # Many Codex builds expect top-level `model` keys (not a [model] table).
+            cfg_lines = [
+                f'model = "{model_name}"',
+                f'model_reasoning_effort = "{self._reasoning_effort}"',
+                "",
+                "[history]",
+                'persistence = "none"',
+            ]
+            config_path.write_text("\n".join(cfg_lines) + "\n", encoding="utf-8")
+        except Exception as e:
+            shutil.rmtree(overlay, ignore_errors=True)
+            raise RuntimeError(f"Failed to write Codex overlay config: {e}") from e
+        return str(overlay)
+
+    def _merge_batch_overlay_config(
+        self,
+        overlay_home: str,
+        *,
+        approval_policy: str,
+        max_output_tokens: int | None,
+    ) -> None:
+        """Write quoted Codex settings into the overlay config.
+
+        A ``.cmd`` shim rewrites quotes, so ``-c key="value"`` cannot carry
+        these settings. They are the same keys ``-c`` would set.
+        """
+        path = Path(overlay_home) / "config.toml"
+        existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+        lines = [f"approval_policy = {self._toml_string(approval_policy)}"]
+        if max_output_tokens is not None:
+            lines.append(f"model_max_output_tokens = {int(max_output_tokens)}")
+        block = "\n".join(lines)
+        if "[history]" in existing:
+            updated = existing.replace("[history]", f"{block}\n\n[history]", 1)
+        elif existing.strip():
+            updated = existing.rstrip() + "\n" + block + "\n"
+        else:
+            updated = block + "\n"
+        path.write_text(updated, encoding="utf-8")
+
+    def _codex_available(self) -> bool:
+        """Return True if `codex` binary is available and functional (sync check)."""
+        return self._codex_available_status() == "ok"
+
+    def _codex_available_status(self) -> str:
+        """Return availability status: 'ok', 'not_installed', or 'broken'.
+
+        Distinguishes between a missing binary (not_installed) and
+        an installed-but-nonfunctional binary (broken, e.g. missing
+        auth or config) so health checks can report correctly.
+        """
+        try:
+            codex_bin = resolve_cli_binary("codex", env_var="CHUNKHOUND_CODEX_BIN")
+            res = subprocess.run(
+                build_cli_argv(codex_bin, "--version"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=self.VERSION_CHECK_TIMEOUT,
+                check=False,
+            )
+            return "ok" if res.returncode == 0 else "broken"
+        except FileNotFoundError:
+            return "not_installed"
+        except (subprocess.SubprocessError, OSError, RuntimeError):
+            return "broken"
+
+    @staticmethod
+    @functools.lru_cache(maxsize=1)
+    def get_highest_priority_available_model() -> str | None:
+        """Discover the highest-priority visible model from Codex CLI.
+
+        Runs `codex debug models` and returns the slug of the model with the
+        highest `priority` value among models with `visibility=list`.
+
+        The result is cached for the lifetime of the process to avoid
+        repeated subprocess calls.
+
+        Returns None if the command fails or no visible models are found.
+        """
+        try:
+            codex_bin = resolve_cli_binary("codex", env_var="CHUNKHOUND_CODEX_BIN")
+            proc = subprocess.Popen(
+                build_cli_argv(codex_bin, "debug", "models"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                stdout, _stderr = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                # subprocess kills only cmd.exe. Node from a .cmd shim would survive.
+                if is_windows_batch_shim(codex_bin):
+                    kill_windows_process_tree(proc.pid)
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                raise
+            if proc.returncode != 0:
+                return None
+
+            output = (stdout or b"").decode("utf-8", errors="ignore")
+            # Parse as NDJSON: try each non-empty line as a JSON object.
+            # This is more robust than brace-counting when the CLI prints
+            # log lines or multiple JSON objects.
+            for line in output.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                models = obj.get("models")
+                if isinstance(models, list):
+                    visible = [
+                        m
+                        for m in models
+                        if isinstance(m, dict)
+                        and m.get("visibility") == "list"
+                        and "slug" in m
+                    ]
+                    if visible:
+                        best = max(visible, key=lambda m: m.get("priority", 0))
+                        return str(best["slug"])
+            return None
+        except (
+            subprocess.SubprocessError,
+            OSError,
+            json.JSONDecodeError,
+            RuntimeError,
+        ) as e:
+            logger.debug(f"Model discovery via 'codex debug models' failed: {e}")
+        return None
+
+    async def _run_exec(
+        self,
+        content: str,
+        *,
+        cwd: str | None = None,
+        max_tokens: int | None,
+        timeout: int | None,
+        model: str | None,
+    ) -> str:
+        """Run `codex exec` and capture stdout with robust fallbacks."""
+        try:
+            binary = resolve_cli_binary("codex", env_var="CHUNKHOUND_CODEX_BIN")
+        except FileNotFoundError as e:
+            raise RuntimeError(str(e)) from e
+        batch_shim = is_windows_batch_shim(binary)
+        overlay_home: str | None = None
+        config_file_path: str | None = None
+        extra_args: list[str] = []
+
+        env = os.environ.copy()
+        effective_model = (
+            self._resolve_model_name(model) if model else self._get_resolved_model()
+        )
+        keep_overlay = os.getenv("CHUNKHOUND_CODEX_KEEP_OVERLAY", "0") == "1"
+
+        # Optional verbose diagnostics for large prompts / transport issues.
+        debug_codex = os.getenv("CHUNKHOUND_CODEX_DEBUG", "0") == "1"
+        json_mode = os.getenv("CHUNKHOUND_CODEX_JSON", "0") == "1"
+        content_chars = len(content)
+        estimated_tokens = self.estimate_tokens(content)
+        if debug_codex:
+            logger.debug(
+                "Codex CLI request: model=%s, chars=%d, est_tokens=%d, max_tokens=%s",
+                effective_model,
+                content_chars,
+                estimated_tokens,
+                max_tokens,
+            )
+
+        # Helper to forward selected env keys
+        def _forward_env(keys: list[str]) -> None:
+            for k in keys:
+                v = os.environ.get(k)
+                if v is not None:
+                    env[k] = v
+
+        auth_keys = [
+            s.strip()
+            for s in os.getenv(
+                "CHUNKHOUND_CODEX_AUTH_ENV",
+                "OPENAI_API_KEY,CODEX_API_KEY,ANTHROPIC_API_KEY,BEARER_TOKEN",
+            ).split(",")
+            if s.strip()
+        ]
+        passthrough_keys = [
+            s.strip()
+            for s in os.getenv(
+                "CHUNKHOUND_CODEX_PASSTHROUGH_ENV",
+                "",
+            ).split(",")
+            if s.strip()
+        ]
+
+        overlay_home = self._build_overlay_home(effective_model)
+        env["CODEX_HOME"] = overlay_home
+        config_file_path = str(Path(overlay_home) / "config.toml")
+
+        # Reduce risk of slow/hanging command execution by forcing a strict sandbox
+        # and a non-interactive approval policy.
+        sandbox_mode = self._resolve_sandbox_mode()
+        approval_policy = self._resolve_approval_policy()
+
+        # Sandbox has a CLI flag. Approval, reasoning effort, and the output
+        # cap are config keys. A batch shim rewrites the quotes in ``-c``
+        # values, so those keys go in the overlay file instead.
+        extra_args += ["--sandbox", sandbox_mode]
+        if not batch_shim:
+            extra_args += [
+                "-c",
+                f"approval_policy={self._toml_string(approval_policy)}",
+            ]
+            extra_args += [
+                "-c",
+                f"model_reasoning_effort={self._toml_string(self._reasoning_effort)}",
+            ]
+            if max_tokens is not None:
+                extra_args += ["-c", f"model_max_output_tokens={max_tokens}"]
+
+        override_mode = (
+            os.getenv("CHUNKHOUND_CODEX_CONFIG_OVERRIDE", "env").strip().lower()
+        )
+        if config_file_path:
+            if override_mode == "flag":
+                flag = os.getenv("CHUNKHOUND_CODEX_CONFIG_FLAG", "--config")
+                extra_args += [flag, config_file_path]
+            else:
+                cfg_key = os.getenv("CHUNKHOUND_CODEX_CONFIG_ENV", "CODEX_CONFIG")
+                env[cfg_key] = config_file_path
+
+        _forward_env(auth_keys + passthrough_keys)
+
+        # Non-interactive defaults to avoid hangs in subprocess tools.
+        env.setdefault("CI", "1")
+        env.setdefault("GIT_TERMINAL_PROMPT", "0")
+        env.setdefault("PAGER", "cat")
+        env.setdefault("GIT_PAGER", "cat")
+        env.setdefault("TERM", "dumb")
+        env.setdefault("NO_COLOR", "1")
+
+        request_timeout = timeout if timeout is not None else self._timeout
+
+        # Use stdin by default to avoid leaking prompts in the process list.
+        # Fallback to argv if the CLI rejects stdin, except for batch shims,
+        # which always use stdin. Set CHUNKHOUND_CODEX_STDIN_FIRST=0 to prefer
+        # argv mode for a native binary.
+        max_arg_chars = int(os.getenv("CHUNKHOUND_CODEX_ARG_LIMIT", "200000"))
+        stdin_first = os.getenv("CHUNKHOUND_CODEX_STDIN_FIRST", "1") != "0"
+        # Free-form prompts contain quotes, newlines, and %. A batch shim
+        # cannot carry that text as an argument.
+        if batch_shim:
+            use_stdin = True
+        else:
+            use_stdin = True if stdin_first else (len(content) > max_arg_chars)
+        if debug_codex:
+            logger.debug(
+                "Codex CLI transport selection: stdin_first=%s, use_stdin=%s, "
+                "max_arg_chars=%d",
+                stdin_first,
+                use_stdin,
+                max_arg_chars,
+            )
+        # Newer Codex builds require --skip-git-repo-check; default to passing
+        # it on the first attempt to avoid noisy negotiation warnings. This
+        # can be disabled via CHUNKHOUND_CODEX_SKIP_GIT_CHECK=0 if needed for
+        # older binaries.
+        add_skip_git = os.getenv("CHUNKHOUND_CODEX_SKIP_GIT_CHECK", "1") != "0"
+
+        last_error: Exception | None = None
+        try:
+            if batch_shim:
+                try:
+                    self._merge_batch_overlay_config(
+                        overlay_home,
+                        approval_policy=approval_policy,
+                        max_output_tokens=max_tokens,
+                    )
+                except OSError as e:
+                    raise RuntimeError(
+                        f"Failed to write Codex batch overlay config: {e}"
+                    ) from e
+            for attempt in range(self._max_retries):
+                proc: asyncio.subprocess.Process | None = None
+                try:
+                    if use_stdin:
+                        if debug_codex:
+                            logger.debug(
+                                "Codex CLI attempt %d: stdin transport (skip_git=%s)",
+                                attempt + 1,
+                                add_skip_git,
+                            )
+                        proc = await asyncio.create_subprocess_exec(
+                            *build_cli_argv(
+                                binary,
+                                "exec",
+                                "-",
+                                *(["--json"] if json_mode else []),
+                                *extra_args,
+                                *(["--skip-git-repo-check"] if add_skip_git else []),
+                            ),
+                            cwd=cwd,
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            env=env,
+                        )
+                        assert proc.stdin is not None
+                        proc.stdin.write(content.encode("utf-8"))
+                        await proc.stdin.drain()
+                        proc.stdin.close()
+                        stdout, stderr = await asyncio.wait_for(
+                            proc.communicate(), timeout=request_timeout
+                        )
+                    else:
+                        # argv mode
+                        if debug_codex:
+                            logger.debug(
+                                "Codex CLI attempt %d: argv transport (skip_git=%s)",
+                                attempt + 1,
+                                add_skip_git,
+                            )
+                        proc = await asyncio.create_subprocess_exec(
+                            *build_cli_argv(
+                                binary,
+                                "exec",
+                                content,
+                                *(["--json"] if json_mode else []),
+                                *extra_args,
+                                *(["--skip-git-repo-check"] if add_skip_git else []),
+                            ),
+                            cwd=cwd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            env=env,
+                        )
+                        stdout, stderr = await asyncio.wait_for(
+                            proc.communicate(), timeout=request_timeout
+                        )
+
+                    if proc.returncode != 0:
+                        raw_err = stderr.decode("utf-8", errors="ignore")
+                        err = self._sanitize_text(raw_err)
+                        if debug_codex:
+                            logger.debug(
+                                "Codex CLI non-zero exit (attempt %d, "
+                                "use_stdin=%s): %s",
+                                attempt + 1,
+                                use_stdin,
+                                err,
+                            )
+                        if add_skip_git and self._skip_git_flag_unsupported(err):
+                            add_skip_git = False
+                            logger.warning(
+                                "codex exec does not support "
+                                "--skip-git-repo-check; retrying without flag"
+                            )
+                            continue
+                        err_lower = err.lower()
+
+                        # Negotiate --skip-git-repo-check flag for newer Codex builds.
+                        if "skip-git-repo-check" in err and not add_skip_git:
+                            add_skip_git = True
+                            logger.warning(
+                                "codex exec requires --skip-git-repo-check; "
+                                "retrying with flag"
+                            )
+                            continue
+
+                        # If stdin failed, fall back to argv. A batch shim
+                        # cannot take the prompt on argv, so that fallback
+                        # is not available.
+                        if use_stdin and (
+                            "broken pipe" in err_lower or "stdin" in err_lower
+                        ):
+                            if batch_shim:
+                                raise RuntimeError(
+                                    "codex exec rejected stdin, and a Windows "
+                                    "batch shim cannot carry the prompt on "
+                                    f"the command line: {err}"
+                                )
+                            use_stdin = False
+                            logger.warning(
+                                "codex exec stdin not supported; "
+                                "retrying with argv mode"
+                            )
+                            continue
+                        last_error = RuntimeError(
+                            f"codex exec failed (exit {proc.returncode}): {err}"
+                        )
+                        if attempt < self._max_retries - 1:
+                            logger.warning(
+                                f"codex exec attempt {attempt + 1} failed; "
+                                f"retrying: {err}"
+                            )
+                            continue
+                        raise last_error
+
+                    stdout_text = stdout.decode("utf-8", errors="ignore").strip()
+                    if json_mode:
+                        message, usage = self._extract_agent_message_from_jsonl(
+                            stdout_text
+                        )
+                        if debug_codex and usage:
+                            logger.debug("Codex CLI usage: %s", usage)
+                        if message and message.strip():
+                            return message.strip()
+                        # Fall back to raw output if we couldn't parse an agent message.
+                    return stdout_text
+
+                except asyncio.TimeoutError as e:
+                    last_error = RuntimeError(
+                        f"codex exec timed out after {request_timeout}s"
+                    )
+                    if debug_codex:
+                        logger.debug(
+                            "Codex CLI timeout on attempt %d after %ds",
+                            attempt + 1,
+                            request_timeout,
+                        )
+                    if attempt < self._max_retries - 1:
+                        logger.warning(
+                            f"codex exec attempt {attempt + 1} timed out; retrying"
+                        )
+                        continue
+                    raise last_error from e
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    # Treat stdin connection loss as "no stdin support".
+                    if use_stdin and batch_shim:
+                        raise RuntimeError(
+                            "codex exec lost its stdin pipe, and a Windows "
+                            "batch shim cannot carry the prompt on the "
+                            "command line"
+                        ) from e
+                    if use_stdin:
+                        use_stdin = False
+                        if debug_codex:
+                            logger.debug(
+                                "Codex CLI stdin connection lost on "
+                                "attempt %d; switching to argv",
+                                attempt + 1,
+                            )
+                        if attempt < self._max_retries - 1:
+                            logger.warning(
+                                "codex exec stdin connection lost; "
+                                "retrying with argv mode"
+                            )
+                            continue
+                        raise RuntimeError(
+                            "codex exec failed: stdin connection lost "
+                            "and no retries left"
+                        ) from e
+                    raise
+                except OSError as e:
+                    # Switch to stdin if argv is too long.
+                    if e.errno == 7:  # Argument list too long
+                        if not use_stdin:
+                            use_stdin = True
+                            if debug_codex:
+                                logger.debug(
+                                    "Codex CLI argv too long on attempt %d; "
+                                    "switching to stdin",
+                                    attempt + 1,
+                                )
+                            logger.warning(
+                                "codex exec argv too long; retrying with stdin mode"
+                            )
+                            continue
+                    raise
+                finally:
+                    # Kill the CLI if it still runs (timeout, error or cancellation).
+                    if proc is not None:
+                        await terminate_cli_process(proc)
+
+        finally:
+            # Cleanup temporary resources regardless of success or failure
+            try:
+                if overlay_home and Path(overlay_home).exists():
+                    if keep_overlay:
+                        logger.warning(
+                            "CHUNKHOUND_CODEX_KEEP_OVERLAY=1; preserving overlay at %s",
+                            overlay_home,
+                        )
+                    else:
+                        shutil.rmtree(overlay_home, ignore_errors=True)
+            except Exception:
+                pass
+
+        raise last_error or RuntimeError("codex exec failed after retries")
+
+    def _sanitize_text(self, s: str, max_len: int | None = None) -> str:
+        """Truncate and redact secrets. Delegates to shared utility."""
+        limit = max_len or int(os.getenv("CHUNKHOUND_CODEX_LOG_MAX_ERR", "800"))
+        return sanitize_error_text(s, max_length=limit)
+
+    def _skip_git_flag_unsupported(self, err: str) -> bool:
+        lowered = err.lower()
+        if "--skip-git-repo-check" not in lowered:
+            return False
+        return any(marker in lowered for marker in self.UNSUPPORTED_FLAG_MARKERS)
+
+    # ----- BaseCLIProvider hooks -----
+
+    def _get_provider_name(self) -> str:
+        return "codex-cli"
+
+    async def _run_cli_command(
+        self,
+        prompt: str,
+        system: str | None = None,
+        max_completion_tokens: int | None = None,
+        timeout: int | None = None,
+    ) -> str:
+        text = self._merge_prompts(prompt, system)
+        return await self._run_exec(
+            text,
+            cwd=None,
+            max_tokens=max_completion_tokens,
+            timeout=timeout,
+            model=self._model,
+        )
+
+    async def health_check(self) -> dict[str, Any]:
+        status = self._codex_available_status()
+        if status != "ok":
+            err_msg = (
+                "codex not installed"
+                if status == "not_installed"
+                else "codex installed but not functional (check auth/config)"
+            )
+            return {
+                "status": "unhealthy",
+                "provider": self.name,
+                "error": err_msg,
+            }
+        try:
+            resolved_model = self._resolve_model_name(self._model)
+            sample = await self.complete(
+                "Say 'OK'", max_completion_tokens=10, timeout=self.HEALTH_CHECK_TIMEOUT
+            )
+            return {
+                "status": "healthy",
+                "provider": self.name,
+                "model": resolved_model,
+                "test_response": sample.content[:50],
+            }
+        except Exception as e:  # noqa: BLE001
+            return {"status": "unhealthy", "provider": self.name, "error": str(e)}
+
+    def get_synthesis_concurrency(self) -> int:
+        """Get recommended concurrency for parallel synthesis operations.
+
+        Default aligns with Anthropic (5), but remains configurable via env var.
+        """
+        try:
+            v = int(os.getenv("CHUNKHOUND_CODEX_SYNTHESIS_CONCURRENCY", "5"))
+        except Exception:
+            return 5
+        return max(1, min(5, v))

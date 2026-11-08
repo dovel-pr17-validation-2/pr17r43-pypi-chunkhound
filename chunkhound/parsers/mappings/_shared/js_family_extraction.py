@@ -1,0 +1,339 @@
+"""Shared extraction logic for JavaScript-family mappings (JS/TS/JSX/TSX).
+
+Provides a single, minimal implementation of the universal extraction trio:
+`extract_name`, `extract_metadata`, and `extract_content`, shared by the
+JS, JSX, TS and TSX mappings.
+
+Besides definitions and comments, the JS family chunks two concepts that only
+occur at the top level of a file: IMPORT (import statements) and BLOCK (call
+statements such as `describe(...)`, `it(...)`, an IIFE or `app.listen(...)`).
+"""
+
+from typing import Any
+
+from tree_sitter import Node as TSNode
+
+from chunkhound.parsers.mappings.base import MAX_CONSTANT_VALUE_LENGTH
+from chunkhound.parsers.universal_engine import TOP_LEVEL_STATEMENT, UniversalConcept
+
+
+class JSFamilyExtraction:
+    """Mixin: shared extraction helpers for JS-family mappings."""
+
+    # BaseMapping supplies get_node_text; subclasses must inherit it via MRO
+
+    def extract_name(
+        self,
+        concept: UniversalConcept,
+        captures: dict[str, TSNode],
+        content: bytes,
+    ) -> str:
+        source = content.decode("utf-8", errors="replace")
+
+        if concept == UniversalConcept.DEFINITION:
+            if "name" in captures:
+                name_text = self.get_node_text(captures["name"], source).strip()  # type: ignore[attr-defined]
+                return name_text or "definition"
+            if "definition" in captures:
+                node = captures["definition"]
+                text = self.get_node_text(node, source).strip()  # type: ignore[attr-defined]
+                if text.startswith("export default"):
+                    return "export_default"
+                if "module.exports" in text:
+                    return "module_exports"
+                line = node.start_point[0] + 1
+                return f"definition_line_{line}"
+
+        if concept == UniversalConcept.IMPORT and "definition" in captures:
+            node = captures["definition"]
+            module_node = node.child_by_field_name("source")
+            if module_node is not None:
+                return f"import_{self._string_value(module_node, source)}"
+            return f"import_line_{node.start_point[0] + 1}"
+
+        if concept == UniversalConcept.BLOCK and "definition" in captures:
+            return self._call_statement_name(captures["definition"], source)
+
+        if concept == UniversalConcept.COMMENT and "definition" in captures:
+            node = captures["definition"]
+            return f"comment_line_{node.start_point[0] + 1}"
+
+        return f"unnamed_{concept.value}"
+
+    def _call_statement_name(self, statement: TSNode, source: str) -> str:
+        """Name a top-level call statement.
+
+        ``callee`` or ``callee("first string argument")`` for a named callee,
+        ``iife_line_N`` for an immediately invoked function expression, and
+        ``statement_line_N`` for any other callee.
+        """
+        line = statement.start_point[0] + 1
+        call = statement.named_child(0)
+        if call is not None and call.type == "await_expression":
+            call = call.named_child(0)
+        callee = call.child_by_field_name("function") if call is not None else None
+        if callee is not None and callee.type == "parenthesized_expression":
+            inner = callee.named_child(0)
+            if inner is not None and inner.type in {
+                "function_expression",
+                "function",
+                "arrow_function",
+            }:
+                return f"iife_line_{line}"
+        if callee is None or callee.type not in {"identifier", "member_expression"}:
+            return f"statement_line_{line}"
+        name: str = self.get_node_text(callee, source).strip()  # type: ignore[attr-defined]
+        arguments = call.child_by_field_name("arguments") if call else None
+        first = (
+            arguments.named_child(0)
+            if arguments is not None and arguments.named_child_count
+            else None
+        )
+        if first is not None and first.type in {"string", "template_string"}:
+            return f'{name}("{self._string_value(first, source)}")'
+        return name
+
+    def _string_value(self, node: TSNode, source: str) -> str:
+        """The text between a string or template literal's delimiters.
+
+        Only the delimiters are removed, so quotes inside the string survive:
+        ``'say "hi"'`` gives ``say "hi"``. A template's ``${...}`` stays as
+        written.
+        """
+        text: str = self.get_node_text(node, source)  # type: ignore[attr-defined]
+        if node.child_count >= 2:
+            opening, closing = node.child(0), node.child(node.child_count - 1)
+            if opening is not None and closing is not None:
+                start = opening.end_byte - node.start_byte
+                end = closing.start_byte - node.start_byte
+                return text.encode("utf-8")[start:end].decode("utf-8")
+        return text
+
+    def extract_metadata(
+        self,
+        concept: UniversalConcept,
+        captures: dict[str, TSNode],
+        content: bytes,
+    ) -> dict[str, Any]:
+        meta: dict[str, Any] = {"concept": concept.value}
+
+        if concept == UniversalConcept.BLOCK:
+            # BLOCK is only ever a top-level call statement in the JS family.
+            meta[TOP_LEVEL_STATEMENT] = True
+
+        if concept == UniversalConcept.DEFINITION and "definition" in captures:
+            node = captures["definition"]
+            meta["node_type"] = getattr(node, "type", "")
+            init = captures.get("init")
+            target = init or node
+            try:
+                node_type = getattr(target, "type", "")
+                if node_type == "object":
+                    meta["chunk_type_hint"] = "object"
+                elif node_type == "array":
+                    meta["chunk_type_hint"] = "array"
+                else:
+                    for i in range(getattr(target, "child_count", 0)):
+                        child = target.child(i)
+                        if not child:
+                            continue
+                        if child.type == "object":
+                            meta["chunk_type_hint"] = "object"
+                            break
+                        if child.type == "array":
+                            meta["chunk_type_hint"] = "array"
+                            break
+            except Exception:
+                # Best-effort only; do not set hint on failure
+                pass
+            if "chunk_type_hint" not in meta and getattr(node, "type", "") in {
+                # Captured by LEXICAL_DECLARATION_CONFIG in `_shared/js_query_patterns.py`.
+                # `lexical_declaration` doesn't include "variable" in its node type, so we
+                # set `kind` to avoid falling back to the DEFINITION default (FUNCTION).
+                "lexical_declaration",
+                # Captured by VAR_DECLARATION_CONFIG in `_shared/js_query_patterns.py`.
+                "variable_declaration",
+            }:
+                meta["kind"] = "variable"
+        return meta
+
+    def extract_content(
+        self,
+        concept: UniversalConcept,
+        captures: dict[str, TSNode],
+        content: bytes,
+    ) -> str:
+        source = content.decode("utf-8", errors="replace")
+        node = captures.get("definition") or next(iter(captures.values()), None)
+        return self.get_node_text(node, source) if node is not None else ""  # type: ignore[attr-defined]
+
+    def extract_constants(
+        self,
+        concept: UniversalConcept,
+        captures: dict[str, TSNode],
+        content: bytes,
+    ) -> list[dict[str, str]] | None:
+        """Extract constant definitions from JavaScript/TypeScript code.
+
+        Detects:
+        - const declarations (const FOO = "value")
+        - TypeScript enum members (enum Color { RED = 1 })
+
+        Args:
+            concept: The universal concept being extracted
+            captures: Dictionary of capture names to tree-sitter nodes
+            content: Source code as bytes
+
+        Returns:
+            List of constant dictionaries with 'name' and 'value' keys, or None
+        """
+        if concept != UniversalConcept.DEFINITION:
+            return None
+
+        source = content.decode("utf-8", errors="replace")
+        def_node = captures.get("definition")
+
+        if not def_node:
+            return None
+
+        # Handle TypeScript enum members
+        if def_node.type == "enum_declaration":
+            return self._extract_enum_constants(def_node, source)
+
+        # Handle const declarations (lexical_declaration with const keyword)
+        if def_node.type == "lexical_declaration":
+            return self._extract_lexical_constants(def_node, source)
+
+        # Handle export statements wrapping lexical/enum declarations
+        if def_node.type == "export_statement":
+            inner_decl = self.find_child_by_type(def_node, "lexical_declaration")  # type: ignore[attr-defined]
+            if inner_decl:
+                return self._extract_lexical_constants(inner_decl, source)
+            inner_enum = self.find_child_by_type(def_node, "enum_declaration")  # type: ignore[attr-defined]
+            if inner_enum:
+                return self._extract_enum_constants(inner_enum, source)
+
+        return None
+
+    def _extract_enum_constants(
+        self, enum_node: TSNode, source: str
+    ) -> list[dict[str, str]] | None:
+        """Extract constants from TypeScript enum declaration.
+
+        Args:
+            enum_node: Tree-sitter enum_declaration node
+            source: Source code string
+
+        Returns:
+            List of constant dictionaries or None
+        """
+        constants = []
+
+        # Find enum body
+        enum_body = self.find_child_by_type(enum_node, "enum_body")  # type: ignore[attr-defined]
+        if not enum_body:
+            return None
+
+        # Extract each enum member
+        # Handles both:
+        # - enum_assignment nodes (explicit values: RED = 1)
+        # - property_identifier nodes (implicit values: RED, GREEN, BLUE)
+        for i in range(enum_body.child_count):
+            child = enum_body.child(i)
+            if not child:
+                continue
+
+            if child.type == "enum_assignment":
+                # Explicit value: enum Color { RED = 1 }
+                name_node = self.find_child_by_type(child, "property_identifier")  # type: ignore[attr-defined]
+                if not name_node:
+                    continue
+
+                member_name = self.get_node_text(name_node, source).strip()  # type: ignore[attr-defined]
+                if not member_name:
+                    continue
+
+                # Find value (number, string, or other expression)
+                value = ""
+                for j in range(child.child_count):
+                    value_child = child.child(j)
+                    if value_child and value_child.type not in (
+                        "property_identifier",
+                        "=",
+                    ):
+                        value = self.get_node_text(value_child, source).strip()  # type: ignore[attr-defined]
+                        break
+
+                # Truncate value to 50 characters if longer
+                if len(value) > MAX_CONSTANT_VALUE_LENGTH:
+                    value = value[:MAX_CONSTANT_VALUE_LENGTH]
+
+                constants.append({"name": member_name, "value": value})
+
+            elif child.type == "property_identifier":
+                # Implicit value: enum Color { RED, GREEN, BLUE }
+                member_name = self.get_node_text(child, source).strip()  # type: ignore[attr-defined]
+                if not member_name:
+                    continue
+
+                constants.append({"name": member_name, "value": ""})
+
+        return constants if constants else None
+
+    def _extract_lexical_constants(
+        self, lexical_node: TSNode, source: str
+    ) -> list[dict[str, str]] | None:
+        """Extract constants from const declarations.
+
+        Args:
+            lexical_node: Tree-sitter lexical_declaration node
+            source: Source code string
+
+        Returns:
+            List of constant dictionaries or None
+        """
+        # Check if it's a const declaration (not let)
+        node_text = self.get_node_text(lexical_node, source).strip()  # type: ignore[attr-defined]
+        if not node_text.startswith("const "):
+            return None
+
+        constants = []
+
+        # Find all variable_declarator children
+        for i in range(lexical_node.child_count):
+            child = lexical_node.child(i)
+            if not child or child.type != "variable_declarator":
+                continue
+
+            # Extract variable name
+            name_node = self.find_child_by_type(child, "identifier")  # type: ignore[attr-defined]
+            if not name_node:
+                continue
+
+            var_name = self.get_node_text(name_node, source).strip()  # type: ignore[attr-defined]
+            if not var_name:
+                continue
+
+            # Extract value from the declarator
+            # Look for the value after the name (skip type annotations in TS)
+            value = ""
+            for j in range(child.child_count):
+                value_child = child.child(j)
+                if not value_child:
+                    continue
+
+                # Skip name, type annotations, and operators
+                if value_child.type in ["identifier", "type_annotation", ":", "="]:
+                    continue
+
+                # This should be the actual value
+                value = self.get_node_text(value_child, source).strip()  # type: ignore[attr-defined]
+                break
+
+            # Truncate value to 50 characters if longer
+            if len(value) > MAX_CONSTANT_VALUE_LENGTH:
+                value = value[:MAX_CONSTANT_VALUE_LENGTH]
+
+            constants.append({"name": var_name, "value": value})
+
+        return constants if constants else None

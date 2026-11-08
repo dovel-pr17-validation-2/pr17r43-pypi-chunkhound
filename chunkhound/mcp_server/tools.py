@@ -1,0 +1,1183 @@
+"""Declarative tool registry for MCP server.
+
+This module defines all MCP tools in a single location, providing a unified
+registry that the stdio server uses for tool definitions.
+
+The registry pattern ensures consistent tool metadata and behavior.
+"""
+
+import asyncio
+import inspect
+import os
+import re
+import shutil
+import ssl
+import tempfile
+import types
+import urllib.error
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import (
+    Any,
+    Literal,
+    TypedDict,
+    Union,
+    cast,
+    get_args,
+    get_origin,
+)
+
+try:
+    from typing import NotRequired  # type: ignore[attr-defined]
+except (ImportError, AttributeError):
+    from typing_extensions import NotRequired
+
+from chunkhound.core.config.config import Config
+from chunkhound.database_factory import DatabaseServices
+from chunkhound.embeddings import EmbeddingManager
+from chunkhound.llm_manager import LLMManager
+from chunkhound.mcp_server.status import derive_daemon_status
+from chunkhound.services.research.factory import ResearchServiceFactory
+from chunkhound.services.research.shared.validation import (
+    validate_research_prerequisites,
+)
+
+# Response size limits (tokens)
+MAX_RESPONSE_TOKENS = 20000
+MIN_RESPONSE_TOKENS = 1000
+MAX_ALLOWED_TOKENS = 25000
+
+# Diff chunk cap: prevent OOM when commit_range spans thousands of changed files
+MAX_DIFF_CHUNKS = 500
+# Per-chunk char cap: JSON/HTML diffs are ~1:1 chars-to-tokens; 10k chars stays
+# safely under the 16384-token limit of the smallest supported embedding model.
+MAX_DIFF_CHUNK_CHARS = 10_000
+
+
+def _summarize_subprocess_stderr(stderr: bytes) -> str:
+    """Return the user-visible stderr summary for MCP subprocess failures."""
+    stderr_text = stderr.decode(errors="replace").strip()
+    lines = [line.rstrip() for line in stderr_text.split("\n")]
+    in_traceback = False
+    raise_summary: str | None = None
+    clean: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if line.startswith("Traceback") or line.startswith("  File"):
+            in_traceback = True
+            continue
+        if in_traceback and line.startswith("    "):
+            if stripped.startswith("raise ") and raise_summary is None:
+                raise_summary = stripped.removeprefix("raise ")
+            continue
+        # Reset traceback mode when encountering a non-traceback line
+        # (e.g. the error type after the traceback like "ValueError: ...").
+        # Without this reset, any indented diagnostics that follow the
+        # traceback would be silently consumed.
+        in_traceback = False
+        clean.append(line)
+
+    if clean:
+        return "\n".join(clean)[-500:]
+    if raise_summary:
+        return raise_summary[-500:]
+    return stderr_text[-200:]
+
+
+def _format_fetch_warnings(warnings: list[str]) -> str:
+    """Render fetch warnings as a trailing Markdown blockquote (empty if none).
+
+    Multi-line warnings are prefixed on every line so they stay in the block.
+    """
+    if not warnings:
+        return ""
+    return (
+        "\n\n> **Fetch warnings:**\n"
+        + "\n".join("> - " + w.replace("\n", "\n> ") for w in warnings)
+    )
+
+
+# =============================================================================
+# Schema Generation Infrastructure
+# =============================================================================
+# These utilities generate JSON Schema from Python function signatures,
+# enabling a single source of truth for tool definitions.
+
+
+@dataclass
+class Tool:
+    """Tool definition with metadata and implementation."""
+
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    implementation: Callable
+    requires_embeddings: bool = False
+    requires_llm: bool = False
+    requires_reranker: bool = False
+    requires_db: bool = False
+
+
+# Tool registry - populated by @register_tool decorator
+TOOL_REGISTRY: dict[str, Tool] = {}
+
+
+def tool_requires_db(tool_name: str) -> bool:
+    """Return True when the tool implementation needs DB services.
+
+    This is the daemon/session boundary: non-DB tools must not trigger
+    provider reconnect/open work just because an MCP client called them.
+    """
+    tool = TOOL_REGISTRY.get(tool_name)
+    if tool is None:
+        return True  # Conservative: assume DB needed for unknown tools
+    return tool.requires_db
+
+
+def _python_type_to_json_schema_type(type_hint: Any) -> dict[str, Any]:
+    """Convert Python type hint to JSON Schema type definition.
+
+    Args:
+        type_hint: Python type annotation
+
+    Returns:
+        JSON Schema type definition dict
+    """
+    # Handle None / NoneType
+    if type_hint is None or type_hint is type(None):
+        return {"type": "null"}
+
+    # Get origin for generic types (list, dict, Union, etc.)
+    origin = get_origin(type_hint)
+    args = get_args(type_hint)
+
+    # Handle Union types (including Optional which is Union[T, None])
+    # Note: Python 3.10+ uses types.UnionType for X | Y syntax
+    if origin is Union or isinstance(type_hint, types.UnionType):
+        # Filter out NoneType to find the actual type
+        non_none_types = [arg for arg in args if arg is not type(None)]
+        if len(non_none_types) == 1:
+            # Optional[T] case - just return the T's schema
+            return _python_type_to_json_schema_type(non_none_types[0])
+        else:
+            # Multiple non-None types - use anyOf
+            return {
+                "anyOf": [_python_type_to_json_schema_type(t) for t in non_none_types]
+            }
+
+    # Handle Literal types (e.g., Literal["a", "b"])
+    if origin is Literal:
+        return {"type": "string", "enum": list(args)}
+
+    # Handle basic types
+    if type_hint is str:
+        return {"type": "string"}
+    elif type_hint is int:
+        return {"type": "integer"}
+    elif type_hint is float:
+        return {"type": "number"}
+    elif type_hint is bool:
+        return {"type": "boolean"}
+    elif origin is list:
+        item_type = args[0] if args else Any
+        return {"type": "array", "items": _python_type_to_json_schema_type(item_type)}
+    elif origin is dict:
+        return {"type": "object"}
+    else:
+        # Default to object for complex types
+        return {"type": "object"}
+
+
+def _extract_param_descriptions_from_docstring(func: Callable) -> dict[str, str]:
+    """Extract parameter descriptions from function docstring.
+
+    Parses Google-style docstring Args section.
+
+    Args:
+        func: Function with docstring
+
+    Returns:
+        Dict mapping parameter names to their descriptions
+    """
+    if not func.__doc__:
+        return {}
+
+    descriptions: dict[str, str] = {}
+    lines = func.__doc__.split("\n")
+    in_args_section = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Detect Args section
+        if stripped == "Args:":
+            in_args_section = True
+            continue
+
+        # Exit Args section when we hit another section or empty line after args
+        if in_args_section and (
+            stripped.endswith(":") or (not stripped and descriptions)
+        ):
+            in_args_section = False
+
+        # Parse parameter descriptions
+        if in_args_section and ":" in stripped:
+            # Format: "param_name: description"
+            parts = stripped.split(":", 1)
+            if len(parts) == 2:
+                param_name = parts[0].strip()
+                description = parts[1].strip()
+                descriptions[param_name] = description
+
+    return descriptions
+
+
+def _generate_json_schema_from_signature(func: Callable) -> dict[str, Any]:
+    """Generate JSON Schema from function signature.
+
+    Args:
+        func: Function to analyze
+
+    Returns:
+        JSON Schema parameters dict compatible with MCP tool schema
+    """
+    sig = inspect.signature(func)
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+
+    # Extract parameter descriptions from docstring
+    param_descriptions = _extract_param_descriptions_from_docstring(func)
+
+    for param_name, param in sig.parameters.items():
+        # Skip service/infrastructure parameters that aren't part of the tool API
+        if param_name in (
+            "services",
+            "embedding_manager",
+            "llm_manager",
+            "scan_progress",
+            "progress",
+            "config",
+        ):
+            continue
+
+        annotation: Any = (
+            param.annotation if param.annotation != inspect.Parameter.empty else Any
+        )
+
+        # Convert to JSON Schema type
+        schema = _python_type_to_json_schema_type(annotation)
+
+        # Add description if available from docstring
+        if param_name in param_descriptions:
+            schema["description"] = param_descriptions[param_name]
+
+        # Add default value if present
+        if param.default != inspect.Parameter.empty and param.default is not None:
+            schema["default"] = param.default
+
+        properties[param_name] = schema
+
+        # Mark as required if no default value
+        if param.default == inspect.Parameter.empty:
+            required.append(param_name)
+
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required if required else [],
+    }
+
+
+def register_tool(
+    description: str,
+    requires_embeddings: bool = False,
+    requires_llm: bool = False,
+    requires_reranker: bool = False,
+    name: str | None = None,
+) -> Callable[[Callable], Callable]:
+    """Decorator to register a function as an MCP tool.
+
+    Extracts JSON Schema from function signature and registers in TOOL_REGISTRY.
+
+    Args:
+        description: Comprehensive tool description for LLM users
+        requires_embeddings: Whether tool requires embedding providers
+        requires_llm: Whether tool requires LLM provider
+        requires_reranker: Whether tool requires reranking support
+        name: Optional tool name (defaults to function name)
+
+    Returns:
+        Decorator function
+
+    Example:
+        @register_tool(
+            description="Search using regex patterns",
+            requires_embeddings=False
+        )
+        async def search_regex(pattern: str, page_size: int = 10) -> dict:
+            ...
+    """
+
+    def decorator(func: Callable) -> Callable:
+        tool_name = name or func.__name__
+
+        # Generate schema from function signature
+        parameters = _generate_json_schema_from_signature(func)
+
+        # Register tool in global registry
+        TOOL_REGISTRY[tool_name] = Tool(
+            name=tool_name,
+            description=description,
+            parameters=parameters,
+            implementation=func,
+            requires_embeddings=requires_embeddings,
+            requires_llm=requires_llm,
+            requires_reranker=requires_reranker,
+            requires_db="services" in inspect.signature(func).parameters,
+        )
+
+        return func
+
+    return decorator
+
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+
+def _convert_paths_to_native(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert file paths in search results to native platform format."""
+    from pathlib import Path
+
+    for result in results:
+        if "file_path" in result and result["file_path"]:
+            # Use Path for proper native conversion
+            result["file_path"] = str(Path(result["file_path"]))
+    return results
+
+
+# Type definitions for return values
+class PaginationInfo(TypedDict):
+    """Pagination metadata for search results."""
+
+    offset: int
+    page_size: int
+    has_more: bool
+    total: NotRequired[int | None]
+    next_offset: NotRequired[int | None]
+
+
+class SearchResponse(TypedDict):
+    """Response structure for search operations."""
+
+    results: list[dict[str, Any]]
+    pagination: PaginationInfo
+    warnings: NotRequired[list[str]]
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate token count using simple heuristic (3 chars ≈ 1 token for safety)."""
+    return len(text) // 3
+
+
+_BACKTICK_RUN_RE = re.compile(r"`+")
+
+
+def format_search_results_markdown(
+    results: list[dict[str, Any]],
+    pagination: dict[str, Any],
+    search_type: str,
+) -> str:
+    """Render search results as lean markdown for MCP responses.
+
+    Drops chunk_id, chunk_type, language, metadata, file_extension,
+    line_count, code_preview, is_truncated, similarity_percentage.
+    Retains file_path, line range, symbol/name, content, and (for semantic
+    search) similarity percentage. Appends a pagination footer.
+    """
+    if not results:
+        return "No results found."
+
+    blocks: list[str] = []
+    for result in results:
+        file_path: str = result.get("file_path") or "unknown"
+        start_line: int | None = result.get("start_line")
+        end_line: int | None = result.get("end_line")
+        content: str = result.get("content") or ""
+        symbol: str | None = result.get("symbol") or result.get("name")
+        similarity: float | None = result.get("similarity")
+
+        lang = result.get("language") or ""
+        lang_hint = "" if lang == "unknown" else lang
+
+        # Heading: ## `path` L10–L20 — Symbol (92%)
+        parts: list[str] = [f"## `{file_path}`"]
+        if start_line is not None:
+            line_range = (
+                f"L{start_line}–L{end_line}"
+                if end_line is not None and end_line != start_line
+                else f"L{start_line}"
+            )
+            parts.append(line_range)
+        if symbol:
+            parts.append(f"— {symbol}")
+        if search_type == "semantic" and similarity is not None:
+            pct = int(round(similarity * 100))
+            parts.append(f"({pct}%)")
+
+        heading = " ".join(parts)
+        # Use a fence longer than any backtick run in the content (CommonMark §6.1).
+        max_run = max((len(m.group()) for m in _BACKTICK_RUN_RE.finditer(content)), default=0)
+        fence = "`" * max(3, max_run + 1)
+        block = f"{heading}\n\n{fence}{lang_hint}\n{content}\n{fence}"
+        blocks.append(block)
+
+    body = "\n\n---\n\n".join(blocks)
+
+    # Pagination footer
+    offset: int = pagination.get("offset", 0)
+    total: int | None = pagination.get("total")
+    has_more: bool = pagination.get("has_more", False)
+    next_offset: int | None = pagination.get("next_offset")
+    page_size: int = pagination.get("page_size", len(results))
+
+    start_num = offset + 1
+    end_num = offset + len(results)
+
+    if total is not None and page_size:
+        total_pages = max(1, -(-total // page_size))
+        current_page = (offset // page_size) + 1
+        footer = f"Page {current_page} of {total_pages} (results {start_num}–{end_num} of {total})"
+    else:
+        footer = f"Results {start_num}–{end_num}"
+
+    if has_more and next_offset is not None:
+        footer += f" | next_offset={next_offset}"
+
+    return f"{body}\n\n---\n{footer}"
+
+
+# =============================================================================
+# Tool Descriptions (optimized for LLM consumption)
+# =============================================================================
+
+SEARCH_DESCRIPTION = """Pinpoint specific code locations after building understanding with code_research. Returns structurally-parsed code chunks (functions, classes) — large definitions may span multiple results.
+
+TYPE — choose one:
+- **regex**: Match exact patterns against code content. Use for known identifiers, imports, or string literals.
+  Examples: "def authenticate", "class.*Handler", "import.*pandas", "TODO:.*refactor"
+- **semantic**: Find code by meaning via embedding similarity. Use for concepts or when exact identifiers are unknown.
+  Examples: "authentication logic", "retry with exponential backoff", "database connection pooling"
+
+DECISION GUIDE:
+- Known symbol or pattern → regex
+- Concept or behavior → semantic
+- Cross-file architecture question → call code_research first
+
+GIT HISTORY SEARCH (type='semantic' only):
+- commit_range: Optional git revision range (e.g. 'HEAD~10..HEAD', 'v1.0..v2.0'). When provided with type='semantic', searches changed code in that range.
+- commit_hash: Single commit hash — searches only that commit's diff (equivalent to '<hash>^..<hash>').
+- last_n_commits: Integer shorthand — searches last N commits (equivalent to 'HEAD~N..HEAD').
+- vector_source: Controls search scope when commit input given. 'diff' (default) searches only changed code. 'both' merges diff and DB results. 'db' ignores commit input and searches DB only.
+Note: commit_range, commit_hash, and last_n_commits are mutually exclusive — provide at most one.
+
+OUTPUT: {results: [{file_path, content, start_line, end_line}], pagination}"""
+
+SEARCH_DESCRIPTION_NO_RESEARCH = """Pinpoint specific code locations — find exact symbols, patterns, or concepts in the indexed codebase. Returns structurally-parsed code chunks (functions, classes) — large definitions may span multiple results.
+
+TYPE — choose one:
+- **regex**: Match exact patterns against code content. Use for known identifiers, imports, or string literals.
+  Examples: "def authenticate", "class.*Handler", "import.*pandas", "TODO:.*refactor"
+- **semantic**: Find code by meaning via embedding similarity. Use for concepts or when exact identifiers are unknown.
+  Examples: "authentication logic", "retry with exponential backoff", "database connection pooling"
+
+DECISION GUIDE:
+- Known symbol or pattern → regex
+- Concept or behavior → semantic
+
+OUTPUT: Markdown blocks — file path, line range, symbol name, code block, pagination footer."""
+
+CODE_RESEARCH_DESCRIPTION = """Start here for any coding task. Call code_research first to understand the relevant code area before writing or modifying code.
+
+WORKFLOW:
+1. **Understand** — call code_research to map architecture, components, and data flow
+2. **Deepen** — call again with focused queries on specific subsystems discovered in step 1
+3. **Pinpoint** — switch to search (regex/semantic) for exact file locations and symbol references
+4. **Inspect** — use Explore/grep/read for granular line-level follow-up
+
+WHAT IT RETURNS: Cited markdown report covering architecture overview, key code locations, component relationships, and cross-file data flows.
+
+EXAMPLES:
+- "How does authentication work?" — traces the full auth flow across files
+- "What happens when a request hits /api/users?" — maps the request lifecycle
+- "Explain error handling patterns" — identifies cross-cutting concerns
+
+SCOPE: Use the path parameter to restrict analysis to a subdirectory for faster, focused results.
+
+GIT HISTORY RESEARCH:
+- commit_range: Optional git revision range (e.g. 'HEAD~10..HEAD', 'v1.0..v2.0'). When provided, research incorporates code changed in that range.
+- commit_hash: Single commit hash — researches only that commit's diff (equivalent to '<hash>^..<hash>').
+- last_n_commits: Integer shorthand — researches last N commits (equivalent to 'HEAD~N..HEAD').
+- vector_source: Controls search scope when commit input given. 'diff' (default) researches only changed code. 'both' merges diff and DB results. 'db' ignores commit input and uses DB only.
+Note: commit_range, commit_hash, and last_n_commits are mutually exclusive — provide at most one.
+
+FOLLOW-UP CHAIN:
+- previous_query: Prior query for follow-up framing. When set, the synthesizer frames the answer in the prior topic's context. This changes only the answer's phrasing; it does not alter which code is searched or retrieved.
+
+One call replaces 5-10 manual searches. Call it liberally — understanding first, coding second."""
+
+DAEMON_STATUS_DESCRIPTION = """Report daemon startup, scan, and realtime
+indexing health.
+
+USE FOR:
+- Checking whether initial indexing has completed
+- Inspecting backend-neutral realtime health and resync state
+- Debugging degraded daemon behavior without opening log files
+
+OUTPUT: {status, query_ready, scan_progress}"""
+
+WEBSEARCH_DESCRIPTION = """Search the web for `query`, fetch the top results, build a transient in-memory index over the fetched pages, and run deep research to produce a cited answer. \
+Use when the question requires external documentation, library references, or up-to-date web content — not for searching the local codebase (use `code_research` for that). \
+For follow-up questions, pass the prior query as previous_query — the expander then targets new dimensions instead of re-exploring the same ground, and the synthesizer interprets the current question in the prior topic's context. \
+High-latency; one call replaces a manual "search → read → synthesize" loop. Returns a cited markdown answer."""
+
+FETCHURL_DESCRIPTION = """Fetch a single URL (HTML or PDF) and return a Markdown answer. On large pages with a query, the tool reranks the page's sections against the query using a reranker and elbow cutoff, then passes only the most relevant sections to the LLM. On small pages or when no query is given, the page is truncated and summarized in one LLM call."""
+
+
+# =============================================================================
+# Tool Implementations
+# =============================================================================
+
+
+def _resolve_commit_range(
+    commit_range: str | None,
+    commit_hash: str | None,
+    last_n_commits: int | None,
+) -> str | None:
+    """Resolve mutually-exclusive commit inputs to a single git revision range."""
+    if sum(x is not None for x in [commit_range, commit_hash, last_n_commits]) > 1:
+        raise ValueError("Provide at most one of: commit_range, commit_hash, last_n_commits.")
+    if commit_hash is not None:
+        if not commit_hash.strip():
+            raise ValueError("commit_hash must not be empty.")
+        return f"{commit_hash}^..{commit_hash}"
+    if last_n_commits is not None:
+        if last_n_commits <= 0:
+            raise ValueError("last_n_commits must be a positive integer.")
+        return f"HEAD~{last_n_commits}..HEAD"
+    return commit_range
+
+
+_EMBED_TIMEOUT_SECONDS = 120  # same as provider-level default in .chunkhound.json
+
+
+async def _git_cwd_from_services(services: DatabaseServices) -> Path:
+    """Derive git repo root from the indexed DB path, not from process cwd.
+
+    In MCP / ``--db`` flows the process cwd may point to an unrelated directory.
+    Walking up from the DB file's location via ``git rev-parse --show-toplevel``
+    gives the correct repo root for the indexed project.  Falls back to
+    project-marker detection then cwd only when the git lookup fails.
+    """
+    try:
+        db_path = Path(services.provider.db_path)
+        start = db_path if db_path.is_dir() else db_path.parent
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", str(start), "rev-parse", "--show-toplevel",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode == 0:
+            return Path(stdout.decode("utf-8", errors="replace").strip())
+    except Exception:
+        from loguru import logger as _log
+        _log.debug("git rev-parse failed from {}, falling back", start, exc_info=True)
+
+    # Fallback: project markers, then bare cwd
+    from chunkhound.utils.project_detection import find_project_root
+
+    try:
+        return find_project_root(None)
+    except SystemExit:
+        return Path.cwd()
+
+
+async def _inject_diff_service(
+    services: DatabaseServices,
+    effective_commit_range: str,
+    vector_source: str,
+    embedding_manager: Any,
+) -> tuple[DatabaseServices, str | None]:
+    """Build a DiffAwareSearchService and return it alongside a truncation warning.
+
+    Returns (updated_services, warning_str | None).  The warning is non-None when
+    the diff produced more than MAX_DIFF_CHUNKS chunks and results were capped —
+    callers must surface this to the MCP client so the LLM knows results are partial.
+    """
+    if vector_source not in ("diff", "db", "both"):
+        raise ValueError(f"Invalid vector_source: {vector_source!r}. Must be 'diff', 'db', or 'both'.")
+
+    # Local imports avoid circular dependency: tools → git_diff → (nothing in tools)
+    from loguru import logger as _log
+
+    from chunkhound.core.git_diff import parse_diff_to_chunks, run_git_diff
+    from chunkhound.services.diff_aware_search_service import DiffAwareSearchService
+
+    _cwd = await _git_cwd_from_services(services)
+    raw_diff = await run_git_diff(effective_commit_range, cwd=_cwd)
+    diff_chunks = parse_diff_to_chunks(raw_diff, max_chunk_chars=MAX_DIFF_CHUNK_CHARS)
+    truncation_warning: str | None = None
+    if len(diff_chunks) > MAX_DIFF_CHUNKS:
+        truncation_warning = (
+            f"Diff range produced {len(diff_chunks)} chunks; results capped at "
+            f"{MAX_DIFF_CHUNKS} to avoid OOM. Use a narrower commit range for complete coverage."
+        )
+        _log.warning(truncation_warning)
+        diff_chunks = diff_chunks[:MAX_DIFF_CHUNKS]
+    diff_embeddings: list[list[float]] = []
+    if diff_chunks and embedding_manager is not None:
+        try:
+            emb_result = await asyncio.wait_for(
+                embedding_manager.embed_texts([c.code for c in diff_chunks]),
+                timeout=_EMBED_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"Embedding {len(diff_chunks)} diff chunks timed out after "
+                f"{_EMBED_TIMEOUT_SECONDS}s. Use a smaller commit range or "
+                "set vector_source='db' to skip diff embedding."
+            )
+        diff_embeddings = emb_result.embeddings
+    diff_service = DiffAwareSearchService(
+        original=services.search_service,
+        diff_chunks=diff_chunks,
+        diff_embeddings=diff_embeddings,
+        vector_source=vector_source,
+        embedding_manager=embedding_manager,
+    )
+    return services._replace(search_service=diff_service), truncation_warning
+
+
+@register_tool(
+    description=SEARCH_DESCRIPTION,
+    requires_embeddings=False,
+    name="search",
+)
+async def search_impl(
+    services: DatabaseServices,
+    embedding_manager: EmbeddingManager | None,
+    type: Literal["regex", "semantic"],
+    query: str,
+    path: str | None = None,
+    page_size: int = 10,
+    offset: int = 0,
+    commit_range: str | None = None,
+    commit_hash: str | None = None,
+    last_n_commits: int | None = None,
+    vector_source: str = "diff",
+) -> SearchResponse:
+    """Unified search dispatching to regex or semantic based on type.
+
+    Args:
+        services: Database services bundle
+        embedding_manager: Embedding manager (required for semantic type)
+        type: Search mode — "regex" for exact pattern matching, "semantic" for meaning-based similarity
+        query: For regex: a regex pattern like "def authenticate" or "class.*Handler". For semantic: a natural language concept like "retry logic" or "database connection pooling"
+        path: Optional relative subdirectory to restrict search scope, e.g. "src/auth" or "lib/payments" (no leading slash)
+        page_size: Number of results per page (1-100)
+        offset: Starting offset for pagination
+        commit_range: Optional git revision range (e.g. 'HEAD~10..HEAD', 'v1.0..v2.0'). When provided with type='semantic', searches changed code in that range.
+        commit_hash: Single commit hash — searches only that commit's diff (equivalent to '<hash>^..<hash>').
+        last_n_commits: Integer shorthand — searches last N commits (equivalent to 'HEAD~N..HEAD').
+        vector_source: Controls search scope when commit input given. 'diff' (default) searches only changed code. 'both' merges diff and DB results. 'db' ignores commit input and searches DB only.
+
+    Returns:
+        Dict with 'results' and 'pagination' keys
+
+    Raises:
+        ValueError: If type is invalid or semantic search lacks embedding provider
+    """
+    # Validate type parameter
+    if type not in ("semantic", "regex"):
+        raise ValueError(
+            f"Invalid search type: '{type}'. Must be 'semantic' or 'regex'."
+        )
+
+    # Validate and constrain parameters
+    page_size = max(1, min(page_size, 100))
+    offset = max(0, offset)
+
+    effective_commit_range = _resolve_commit_range(commit_range, commit_hash, last_n_commits)
+
+    if type == "semantic":
+        # Validate embedding manager for semantic search
+        if not embedding_manager or not embedding_manager.list_providers():
+            raise ValueError(
+                "Semantic search requires embedding provider. "
+                "Configure via .chunkhound.json or CHUNKHOUND_EMBEDDING__API_KEY. "
+                "Use type='regex' for pattern-based search without embeddings."
+            )
+
+    truncation_warning: str | None = None
+    if effective_commit_range is not None and type == "semantic" and vector_source != "db":
+        services, truncation_warning = await _inject_diff_service(services, effective_commit_range, vector_source, embedding_manager)
+
+    if type == "semantic":
+
+        # Get default provider/model
+        try:
+            provider_obj = embedding_manager.get_provider()
+            provider_name = provider_obj.name
+            model_name = provider_obj.model
+        except ValueError:
+            raise ValueError("No default embedding provider configured.")
+
+        # Perform semantic search
+        results, pagination = await services.search_service.search_semantic(
+            query=query,
+            page_size=page_size,
+            offset=offset,
+            provider=provider_name,
+            model=model_name,
+            path_filter=path,
+        )
+    else:  # regex
+        # Perform regex search; pass query so results are scored by cosine similarity
+        results, pagination = await services.search_service.search_regex_async(
+            pattern=query,
+            page_size=page_size,
+            offset=offset,
+            path_filter=path,
+            query=query,
+        )
+
+    # Convert file paths to native platform format
+    native_results = _convert_paths_to_native(results)
+
+    response: dict[str, Any] = {"results": native_results, "pagination": pagination}
+    if truncation_warning:
+        response["warnings"] = [truncation_warning]
+    return cast(SearchResponse, response)
+
+
+@register_tool(
+    description=DAEMON_STATUS_DESCRIPTION,
+    requires_embeddings=False,
+    name="daemon_status",
+)
+async def daemon_status_impl(
+    scan_progress: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return backend-neutral daemon and realtime status."""
+    return derive_daemon_status(scan_progress)
+
+
+@register_tool(
+    description=CODE_RESEARCH_DESCRIPTION,
+    requires_embeddings=True,
+    requires_llm=True,
+    requires_reranker=True,
+    name="code_research",
+)
+async def deep_research_impl(
+    services: DatabaseServices,
+    embedding_manager: EmbeddingManager,
+    llm_manager: LLMManager | None,
+    query: str,
+    progress: Any = None,
+    path: str | None = None,
+    config: Config | None = None,
+    commit_range: str | None = None,
+    commit_hash: str | None = None,
+    last_n_commits: int | None = None,
+    vector_source: str = "diff",
+    previous_query: str | None = None,
+) -> dict[str, Any]:
+    """Core deep research implementation.
+
+    Args:
+        services: Database services bundle
+        embedding_manager: Embedding manager instance
+        llm_manager: LLM manager instance
+        query: Natural language question about codebase architecture or behavior, e.g. "how does authentication work end-to-end?" or "explain the request lifecycle"
+        progress: Optional Rich Progress instance for terminal UI (None for MCP)
+        path: Optional relative subdirectory to restrict analysis scope, e.g. "src/auth" or "lib/payments" (no leading slash)
+        config: Application configuration (optional, defaults to environment config)
+        commit_range: Optional git revision range (e.g. 'HEAD~10..HEAD', 'v1.0..v2.0'). When provided, research incorporates code changed in that range.
+        commit_hash: Single commit hash — researches only that commit's diff (equivalent to '<hash>^..<hash>').
+        last_n_commits: Integer shorthand — researches last N commits (equivalent to 'HEAD~N..HEAD').
+        vector_source: Controls search scope when commit input given. 'diff' (default) researches only changed code. 'both' merges diff and DB results. 'db' ignores commit input and uses DB only.
+        previous_query: Prior query for follow-up framing (optional). When set, the synthesis stage frames the answer in the prior topic's context. Does not affect which code is searched or retrieved.
+
+    Returns:
+        Dict with answer and metadata
+
+    Raises:
+        ValueError: If LLM, embeddings, or reranker are not configured
+    """
+    validate_research_prerequisites(embedding_manager, llm_manager)
+
+    effective_commit_range = _resolve_commit_range(commit_range, commit_hash, last_n_commits)
+
+    truncation_warning: str | None = None
+    if effective_commit_range is not None and vector_source != "db":
+        services, truncation_warning = await _inject_diff_service(services, effective_commit_range, vector_source, embedding_manager)
+
+    # Create default config from environment if not provided
+    if config is None:
+        config = Config.from_environment()
+    # Empty-string → None coercion at the surface boundary, so every downstream
+    # consumer sees the two-valued "real string or None" contract.
+    previous_query = previous_query or None
+
+    # Create code research service using factory (v1 or v2 based on config)
+    # This ensures followup suggestions automatically update if tool is renamed
+    research_service = ResearchServiceFactory.create(
+        config=config,
+        db_services=services,
+        embedding_manager=embedding_manager,
+        llm_manager=llm_manager,
+        tool_name="code_research",
+        progress=progress,
+        path_filter=path,
+    )
+
+    result = await research_service.deep_research(query, previous_query=previous_query)
+    if truncation_warning:
+        answer = result.get("answer", "")
+        result["answer"] = f"> **Note:** {truncation_warning}\n\n{answer}"
+    return result
+
+
+@register_tool(
+    description=WEBSEARCH_DESCRIPTION,
+    requires_embeddings=True,
+    requires_llm=True,
+    requires_reranker=True,
+    name="websearch",
+)
+async def websearch_impl(
+    embedding_manager: EmbeddingManager,
+    llm_manager: LLMManager | None,
+    config: Config | None,
+    query: str,
+    limit: int = 30,
+    previous_query: str | None = None,
+) -> str:
+    """Search the web, fetch results, and run deep research over them.
+
+    No path_filter parameter: fetched pages live in a flat tmpdir, so a
+    subdirectory filter would silently match zero chunks.
+
+    Args:
+        embedding_manager: Present solely for capability gating
+            (requires_embeddings=True); signature-inspected by register_tool.
+            Unused in the body — the research stage runs in a subprocess.
+        llm_manager: Used to expand the user query into 3 DuckDuckGo-optimized
+            variants via the utility LLM. When None (no LLM configured), the
+            expander falls back to a single-query dispatch.
+        config: Application configuration; falls back to environment. Its
+            source file (if any) is forwarded to the subprocess as --config.
+        query: Natural-language or keyword query for DuckDuckGo.
+        previous_query: Previous query to build context and chain knowledge (optional).
+        limit: Number of results to fetch. Clamped to [1, 100]. Default 30.
+
+    Returns:
+        Markdown: research answer (with tmpdir paths rewritten to source URLs)
+        + optional fetch-warning block.
+    """
+    from chunkhound.mcp_server.common import MCPError
+    from chunkhound.utils.websearch_core import (
+        build_quickresearch_argv_core,
+        clamp_limit,
+        fetch_and_save,
+        search_multi,
+        websearch_timeout,
+    )
+    from chunkhound.utils.websearch_expansion import expand_web_queries
+    from chunkhound.utils.websearch_postprocess import replace_paths_with_urls
+
+    if config is None:
+        config = Config.from_environment()
+    # Empty-string → None coercion at the surface boundary, so every
+    # downstream consumer sees the two-valued "real string or None" contract.
+    previous_query = previous_query or None
+
+    limit = clamp_limit(limit)
+
+    queries = await expand_web_queries(query, llm_manager, previous_query=previous_query)
+    try:
+        results = await search_multi(queries, limit, None)
+    except urllib.error.HTTPError as e:
+        raise MCPError(f"Web search failed: HTTP {e.code} {e.reason}") from e
+    except urllib.error.URLError as e:
+        raise MCPError(f"Web search failed: {e.reason}") from e
+    if not results:
+        raise MCPError(f"No results found for {query!r}")
+
+    warnings: list[str] = []
+    mapping: dict[str, str] = {}
+    tmpdir = Path(tempfile.mkdtemp(prefix="chunkhound_websearch_mcp_"))
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        await fetch_and_save(
+            [url for _, url, _ in results],
+            tmpdir,
+            progress_callback=None,
+            warning_callback=warnings.append,
+            mapping=mapping,
+        )
+
+        # Positional query is the RAW user input — feeding a lossy narrowing
+        # (e.g. queries[0]) to deep research would silently degrade the
+        # answer with no signal.
+        cmd = build_quickresearch_argv_core(
+            query, tmpdir, config,
+            parent_pid=os.getpid(),
+            previous_query=previous_query,
+        )
+        # Scrub CHUNKHOUND_MCP_MODE so the child's RichOutputFormatter.error()
+        # is not silenced — we rely on its stderr output to populate the
+        # MCPError tail on subprocess failure.
+        env = {k: v for k, v in os.environ.items() if k != "CHUNKHOUND_MCP_MODE"}
+        env["CHUNKHOUND_QUICKRESEARCH_QUIET"] = "1"
+        env["CHUNKHOUND_NO_PROMPTS"] = "1"
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        timeout_s = websearch_timeout()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_s
+            )
+        except asyncio.TimeoutError:
+            raise MCPError(
+                f"websearch timed out after {timeout_s:.0f}s"
+            ) from None
+        if proc.returncode != 0:
+            tail = _summarize_subprocess_stderr(stderr)
+            raise MCPError(
+                f"Research subprocess failed (exit {proc.returncode}): {tail}"
+            )
+        answer = stdout.decode(errors="replace")
+    finally:
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    answer = replace_paths_with_urls(answer, mapping).rstrip()
+    return f"{answer}{_format_fetch_warnings(warnings)}"
+
+
+@register_tool(
+    description=FETCHURL_DESCRIPTION,
+    requires_llm=True,
+    requires_reranker=True,
+    name="fetchurl",
+)
+async def fetchurl_impl(
+    embedding_manager: EmbeddingManager,
+    llm_manager: LLMManager,
+    config: Config | None,
+    url: str,
+    query: str = "",
+) -> str:
+    """Fetch a URL and return a focused Markdown answer.
+
+    Args:
+        embedding_manager: Injected; used to obtain the reranker-capable embedding provider.
+        llm_manager: Injected; used for the extraction call.
+        config: Injected; used for fetchurl thresholds and retry policy.
+        url: Absolute http:// or https:// URL. file://, ftp://, data:, and hosts
+            resolving to loopback / private / link-local addresses are rejected.
+        query: Optional question. When set, focuses extraction; enables rerank+elbow
+            path on pages exceeding fetchurl.rerank_threshold_tokens.
+    """
+    from chunkhound.mcp_server.common import MCPError
+    from chunkhound.utils.fetchurl import FetchUrlError, run_fetchurl
+    from chunkhound.utils.ssrf import SsrfBlockedError
+
+    # Reranker availability is gated upstream: requires_reranker=True on the
+    # @register_tool decorator hides fetchurl from tools/list and makes the
+    # MCP dispatcher raise before we get here (see mcp_server/common.py and
+    # mcp_server/base.py).
+    if config is None:
+        config = Config.from_environment()
+
+    warnings: list[str] = []
+    try:
+        answer = await run_fetchurl(
+            url,
+            query,
+            config,
+            embedding_manager.get_provider(),
+            llm_manager,
+            warning_callback=warnings.append,
+            verbose_log=None,
+        )
+    # asyncio.TimeoutError is a distinct class on Python 3.10 (aliased to
+    # builtin TimeoutError only from 3.11); keep both until requires-python
+    # >= 3.11.
+    except (TimeoutError, asyncio.TimeoutError) as e:
+        raise MCPError("fetchurl timed out") from e
+    except (FetchUrlError, SsrfBlockedError) as e:
+        raise MCPError(f"fetchurl failed: {e}") from e
+    except urllib.error.HTTPError as e:
+        raise MCPError(f"fetchurl failed: HTTP {e.code} {e.reason}") from e
+    except urllib.error.URLError as e:
+        raise MCPError(f"fetchurl failed: {e.reason}") from e
+    # ValueError = fetch_url_to_content content-type / empty-body reject.
+    except (ssl.SSLError, ValueError) as e:
+        raise MCPError(f"fetchurl failed: {e}") from e
+    return f"{answer}{_format_fetch_warnings(warnings)}"
+
+
+# =============================================================================
+# Tool Execution
+# =============================================================================
+
+
+async def execute_tool(
+    tool_name: str,
+    services: Any,
+    embedding_manager: Any,
+    arguments: dict[str, Any],
+    scan_progress: dict | None = None,
+    llm_manager: Any = None,
+    config: Config | None = None,
+) -> dict[str, Any] | str:
+    """Execute a tool from the registry with proper argument handling.
+
+    Args:
+        tool_name: Name of the tool to execute
+        services: DatabaseServices instance
+        embedding_manager: EmbeddingManager instance
+        arguments: Tool arguments from the request
+        scan_progress: Optional scan progress from MCPServerBase
+        llm_manager: Optional LLMManager instance for code_research
+        config: Optional Config instance for research service factory
+
+    Returns:
+        Tool execution result
+
+    Raises:
+        ValueError: If tool not found in registry
+        Exception: If tool execution fails
+    """
+    if tool_name not in TOOL_REGISTRY:
+        raise ValueError(f"Unknown tool: {tool_name}")
+
+    tool = TOOL_REGISTRY[tool_name]
+
+    # Build kwargs by inspecting function signature and mapping available arguments
+    sig = inspect.signature(tool.implementation)
+    kwargs: dict[str, Any] = {}
+
+    for param_name in sig.parameters.keys():
+        # Map infrastructure parameters
+        if param_name == "services":
+            kwargs["services"] = services
+        elif param_name == "embedding_manager":
+            kwargs["embedding_manager"] = embedding_manager
+        elif param_name == "llm_manager":
+            kwargs["llm_manager"] = llm_manager
+        elif param_name == "scan_progress":
+            kwargs["scan_progress"] = scan_progress
+        elif param_name == "config":
+            kwargs["config"] = config
+        elif param_name == "progress":
+            # Progress parameter for terminal UI (None for MCP mode)
+            kwargs["progress"] = None
+        elif param_name in arguments:
+            # Tool-specific parameter from request
+            kwargs[param_name] = arguments[param_name]
+        # If parameter not found and has default, it will use the default
+
+    # Execute the tool
+    result = await tool.implementation(**kwargs)
+
+    # Handle special return types
+    if tool_name == "code_research":
+        # Code research returns dict with 'answer' key - return raw markdown string
+        if isinstance(result, dict):
+            query_arg = arguments.get("query", "unknown")
+            fallback = (
+                "Research incomplete: Unable to analyze "
+                f"'{query_arg}'. "
+                "Try a more specific query or check that relevant code exists."
+            )
+            answer = result.get("answer", fallback)
+            return str(answer)
+
+    # search tool renders dict → lean markdown for MCP, with markdown-based token limiting
+    if tool_name == "search":
+        if isinstance(result, dict):
+            search_type = arguments.get("type", "regex")
+            results_list = list(result.get("results", []))
+            pagination = dict(result.get("pagination", {}))
+            diff_warnings: list[str] = list(result.get("warnings", []))
+            # Mirror the CLI: regex search ignores git diff inputs, so say so.
+            if search_type == "regex":
+                used = [
+                    p
+                    for p in ("commit_range", "commit_hash", "last_n_commits")
+                    if arguments.get(p) is not None
+                ]
+                if used:
+                    diff_warnings.append(
+                        f"type='regex' ignores git diff params ({', '.join(used)}); "
+                        "diff search requires type='semantic'."
+                    )
+            md = format_search_results_markdown(results_list, pagination, search_type)
+            # Keep at least 1 result; preserve original page_size so the footer's
+            # total-page count stays calibrated to the requested page size.
+            while len(results_list) > 1 and estimate_tokens(md) > MAX_RESPONSE_TOKENS:
+                trim = max(1, len(results_list) // 4)
+                results_list = results_list[:-trim]
+                pagination = {
+                    **pagination,
+                    "has_more": True,
+                    "next_offset": pagination.get("offset", 0) + len(results_list),
+                }
+                md = format_search_results_markdown(results_list, pagination, search_type)
+            # If the single remaining result still exceeds the limit, truncate its content.
+            if results_list and estimate_tokens(md) > MAX_RESPONSE_TOKENS:
+                result_copy = dict(results_list[0])
+                content = result_copy.get("content") or ""
+                # Start conservatively. Dynamic fence length (backtick-heavy content adds
+                # two fence lines of max_run+1 backticks each) means the 300-char reserve
+                # can be wildly insufficient; re-render and shrink until the actual output fits.
+                max_content_chars = max(0, MAX_RESPONSE_TOKENS * 3 - 300)
+                result_copy["content"] = content[:max_content_chars] + "\n\n[... truncated ...]"
+                md = format_search_results_markdown([result_copy], pagination, search_type)
+                while estimate_tokens(md) > MAX_RESPONSE_TOKENS and max_content_chars > 0:
+                    excess_chars = (estimate_tokens(md) - MAX_RESPONSE_TOKENS) * 3
+                    max_content_chars = max(0, max_content_chars - excess_chars - 1)
+                    result_copy["content"] = content[:max_content_chars] + "\n\n[... truncated ...]"
+                    md = format_search_results_markdown([result_copy], pagination, search_type)
+            if diff_warnings:
+                warning_block = "\n".join(f"> **Warning:** {w}" for w in diff_warnings)
+                md = f"{warning_block}\n\n{md}"
+            return md
+
+    # String return types (e.g., websearch) pass through directly as markdown
+    if isinstance(result, str):
+        return result
+
+    # Convert result to dict if it's not already
+    if hasattr(result, "__dict__"):
+        return dict(result)
+    elif isinstance(result, dict):
+        return result
+    else:
+        return {"result": result}

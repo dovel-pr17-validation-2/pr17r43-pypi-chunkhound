@@ -1,0 +1,412 @@
+"""LLM Manager with factory pattern for ChunkHound deep research."""
+
+from typing import Any
+
+from loguru import logger
+
+from chunkhound.core.config.llm_config import (
+    BASE_URL_CAPABLE_LLM_PROVIDERS,
+    DEFAULT_LLM_TIMEOUT,
+    NO_DEFAULT_MODEL_PROVIDERS,
+    OPENAI_COMPATIBLE_LLM_PROVIDERS,
+    REASONING_EFFORT_PROVIDERS,
+)
+from chunkhound.core.config.provider_registry import OPENAI_COMPATIBLE_PROVIDERS
+from chunkhound.core.exceptions.core import ConfigurationError
+from chunkhound.core.utils.openai_utils import is_official_openai_endpoint
+from chunkhound.interfaces.llm_provider import LLMProvider, OutputLimitCapability
+from chunkhound.providers.llm.anthropic_llm_provider import AnthropicLLMProvider
+from chunkhound.providers.llm.claude_code_cli_provider import ClaudeCodeCLIProvider
+from chunkhound.providers.llm.codex_cli_provider import CodexCLIProvider
+from chunkhound.providers.llm.gemini_llm_provider import GeminiLLMProvider
+from chunkhound.providers.llm.openai_compatible_provider import OpenAICompatibleProvider
+from chunkhound.providers.llm.openai_llm_provider import OpenAILLMProvider
+from chunkhound.providers.llm.opencode_cli_provider import OpenCodeCLIProvider
+
+
+class LLMManager:
+    """Manager for LLM providers with factory pattern.
+
+    Supports dual-model architecture:
+    - Utility provider: For fast, cheap operations (query expansion, follow-ups)
+    - Synthesis provider: For high-quality, large-context operations (final analysis)
+    """
+
+    # Registry of available providers
+    _providers: dict[str, type[LLMProvider] | Any] = {
+        "openai": OpenAILLMProvider,
+        "anthropic": AnthropicLLMProvider,
+        "claude-code-cli": ClaudeCodeCLIProvider,
+        "codex-cli": CodexCLIProvider,
+        "gemini": GeminiLLMProvider,
+        "opencode-cli": OpenCodeCLIProvider,
+    }
+
+    def __init__(
+        self, utility_config: dict[str, Any], synthesis_config: dict[str, Any]
+    ):
+        """Initialize LLM manager with dual providers.
+
+        Args:
+            utility_config: Configuration for utility operations provider
+            synthesis_config: Configuration for synthesis operations provider
+        """
+        self._utility_config = utility_config
+        self._synthesis_config = synthesis_config
+        self._utility_provider: LLMProvider | None = None
+        self._synthesis_provider: LLMProvider | None = None
+
+        # Initialize both providers
+        self._initialize_utility_provider()
+        self._initialize_synthesis_provider()
+
+    def _create_provider(self, config: dict[str, Any]) -> LLMProvider:
+        """Create a provider instance from configuration.
+
+        Args:
+            config: Provider configuration dictionary
+
+        Returns:
+            Initialized LLMProvider instance
+
+        Raises:
+            ValueError: If provider name is unknown
+        """
+        provider_name = config.get("provider", "openai")
+
+        # ── OpenAI-compatible providers from registry (data-driven) ──
+        if provider_name in OPENAI_COMPATIBLE_PROVIDERS:
+            return self._create_openai_compatible_provider(provider_name, config)
+
+        if provider_name not in self._providers:
+            available = ", ".join(self.list_providers())
+            raise ValueError(
+                f"Unknown LLM provider: {provider_name}. "
+                f"Available providers: {available}"
+            )
+
+        provider_class = self._providers[provider_name]
+
+        try:
+            # Build provider initialization parameters
+            model_name = config.get("model")
+            base_url = config.get("base_url")
+            # Note: Registry providers (deepseek, grok) exit at the
+            # OPENAI_COMPATIBLE_PROVIDERS guard above. This check fires
+            # only for native providers without baked-in defaults
+            # (currently only "gemini" — Anthropic has a baked-in CLI
+            # default; OpenAILLMProvider resolves at the config layer).
+            if provider_name in NO_DEFAULT_MODEL_PROVIDERS and not model_name:
+                raise ConfigurationError(
+                    config_key="llm.model",
+                    reason=(
+                        f"Model is required for '{provider_name}'. "
+                        "Set `llm.model` (or the per-role model override) in "
+                        "your configuration."
+                    ),
+                )
+
+            if (
+                provider_name in OPENAI_COMPATIBLE_LLM_PROVIDERS
+                and not is_official_openai_endpoint(base_url)
+                and not model_name
+            ):
+                raise ValueError(
+                    "Custom OpenAI-compatible LLM endpoints require an explicit "
+                    "model. Set `llm.model` (or the per-role model override) "
+                    "when using `llm.base_url`."
+                )
+
+            provider_kwargs = {
+                "api_key": config.get("api_key"),
+                "timeout": config.get("timeout", DEFAULT_LLM_TIMEOUT),
+                "max_retries": config.get("max_retries", 3),
+            }
+            if model_name:
+                provider_kwargs["model"] = model_name
+
+            # Only providers that support custom endpoints should receive base_url.
+            if provider_name in BASE_URL_CAPABLE_LLM_PROVIDERS:
+                provider_kwargs["base_url"] = config.get("base_url")
+                provider_kwargs["ssl_verify"] = config.get("ssl_verify", True)
+
+            # Forward supports_structured_outputs for OpenAI-compatible providers
+            if issubclass(provider_class, OpenAICompatibleProvider):
+                sso = config.get("supports_structured_outputs")
+                if sso is not None:
+                    provider_kwargs["supports_structured_outputs"] = sso
+
+            # Pass reasoning_effort to providers that support it
+            if provider_name in REASONING_EFFORT_PROVIDERS:
+                effort = config.get("reasoning_effort")
+                if effort:
+                    provider_kwargs["reasoning_effort"] = effort
+            elif provider_name == "anthropic":
+                # Extended thinking
+                provider_kwargs["thinking_enabled"] = config.get(
+                    "thinking_enabled", False
+                )
+                provider_kwargs["thinking_budget_tokens"] = config.get(
+                    "thinking_budget_tokens", 10000
+                )
+                provider_kwargs["interleaved_thinking"] = config.get(
+                    "interleaved_thinking", False
+                )
+                if thinking_mode := config.get("thinking_mode"):
+                    provider_kwargs["thinking_mode"] = thinking_mode
+                if thinking_display := config.get("thinking_display"):
+                    provider_kwargs["thinking_display"] = thinking_display
+
+                # Effort parameter (Opus 4.5/4.6/4.7, Sonnet 4.6, Mythos)
+                if effort := config.get("effort"):
+                    provider_kwargs["effort"] = effort
+
+                # Prompt caching is opt-in; cache writes cost extra and
+                # ChunkHound requests rarely reuse prefixes enough to benefit.
+                provider_kwargs["prompt_caching"] = config.get("prompt_caching", False)
+                if cache_ttl := config.get("cache_ttl"):
+                    provider_kwargs["cache_ttl"] = cache_ttl
+
+                # Task budgets (beta, Opus 4.7 only)
+                if (budget := config.get("task_budget_tokens")) is not None:
+                    provider_kwargs["task_budget_tokens"] = budget
+
+                # Context management
+                if config.get("context_management_enabled"):
+                    provider_kwargs["context_management_enabled"] = True
+                    if (
+                        keep_turns := config.get("clear_thinking_keep_turns")
+                    ) is not None:
+                        provider_kwargs["clear_thinking_keep_turns"] = keep_turns
+                    if (
+                        trigger := config.get("clear_tool_uses_trigger_tokens")
+                    ) is not None:
+                        provider_kwargs["clear_tool_uses_trigger_tokens"] = trigger
+                    if (keep := config.get("clear_tool_uses_keep")) is not None:
+                        provider_kwargs["clear_tool_uses_keep"] = keep
+
+            elif provider_name == "gemini":
+                if (thinking_level := config.get("thinking_level")) is not None:
+                    provider_kwargs["thinking_level"] = thinking_level
+                if (thinking_budget := config.get("thinking_budget")) is not None:
+                    provider_kwargs["thinking_budget"] = thinking_budget
+
+            elif provider_name == "claude-code-cli":
+                provider_kwargs["append_system_prompt"] = config.get(
+                    "append_system_prompt", "file"
+                )
+                if temp_dir := config.get("temp_dir"):
+                    provider_kwargs["temp_dir"] = temp_dir
+
+            provider = provider_class(**provider_kwargs)
+            return provider
+        except Exception as e:
+            logger.error(f"Failed to initialize LLM provider {provider_name}: {e}")
+            raise
+
+    def _create_openai_compatible_provider(
+        self, name: str, config: dict[str, Any]
+    ) -> OpenAICompatibleProvider:
+        """Create an OpenAI-compatible provider from a registry spec + config.
+
+        Args:
+            name: Provider name key from ``OPENAI_COMPATIBLE_PROVIDERS``.
+            config: Provider configuration dict (from ``LLMConfig``).
+
+        Returns:
+            Configured ``OpenAICompatibleProvider`` instance.
+
+        Raises:
+            ValueError: If required ``model`` is missing.
+        """
+        spec = OPENAI_COMPATIBLE_PROVIDERS[name]
+
+        model_name = config.get("model")
+        if not model_name:
+            raise ValueError(
+                f"Model is required for '{name}'. "
+                f"Set `llm.model` (or per-role model override) in your configuration."
+            )
+
+        base_url = config.get("base_url")
+        if (
+            base_url is not None
+            and spec.structured_reasoning_disable_extra_body is not None
+        ):
+            logger.debug(
+                f"{name}: explicit llm.base_url disables structured reasoning "
+                "negotiation; the reasoning-disable payload will not be sent."
+            )
+
+        kwargs: dict[str, Any] = {
+            "provider_name": name,
+            "api_key": config.get("api_key"),
+            "model": model_name,
+            "default_base_url": spec.default_base_url,
+            "base_url": base_url,
+            "ssl_verify": config.get("ssl_verify", True),
+            "timeout": config.get("timeout", DEFAULT_LLM_TIMEOUT),
+            "max_retries": config.get("max_retries", 3),
+            "max_tokens_param_name": spec.max_tokens_param_name,
+            "synthesis_concurrency": spec.synthesis_concurrency,
+            "output_limit_omission": (
+                spec.output_limit_omission
+                if base_url is None
+                else OutputLimitCapability.UNKNOWN
+            ),
+            "structured_reasoning_disable_extra_body": (
+                spec.structured_reasoning_disable_extra_body
+                if base_url is None
+                else None
+            ),
+        }
+
+        # Structured outputs: config override > spec default > class default
+        sso = config.get("supports_structured_outputs")
+        if sso is not None:
+            kwargs["supports_structured_outputs"] = sso
+        else:
+            kwargs["supports_structured_outputs"] = spec.supports_structured_outputs
+
+        # Reasoning effort: only when the provider supports it
+        if spec.supports_reasoning_effort:
+            if effort := config.get("reasoning_effort"):
+                kwargs["reasoning_effort"] = effort
+
+        provider = OpenAICompatibleProvider(**kwargs)
+        return provider
+
+    def create_provider_for_config(self, config: dict[str, Any]) -> LLMProvider:
+        """Public factory for constructing an LLM provider from a config dict.
+
+        This wraps the internal _create_provider helper so that callers outside
+        this module (for example, agent-doc assembly specialization) do not
+        need to rely on private APIs or provider-specific wiring details.
+        """
+        return self._create_provider(config)
+
+    def _initialize_utility_provider(self) -> None:
+        """Initialize the utility LLM provider."""
+        self._utility_provider = self._create_provider(self._utility_config)
+        logger.info(
+            f"Initialized utility LLM provider: {self._utility_config.get('provider')} "
+            f"with model: {self._utility_provider.model}"
+        )
+
+    def _initialize_synthesis_provider(self) -> None:
+        """Initialize the synthesis LLM provider and attach its output policy."""
+        self._synthesis_provider = self._create_provider(self._synthesis_config)
+        self._synthesis_provider.configure_synthesis_output_limit_policy(
+            output_limits_enabled=self._synthesis_config.get(
+                "output_limits_enabled", False
+            ),
+            fallback_tokens=self._synthesis_config.get(
+                "output_limit_fallback", 64_000
+            ),
+        )
+        logger.info(
+            f"Initialized synthesis LLM provider: "
+            f"{self._synthesis_config.get('provider')} "
+            f"with model: {self._synthesis_provider.model}"
+        )
+
+    def get_utility_provider(self) -> LLMProvider:
+        """Get the utility LLM provider (for fast operations).
+
+        Returns:
+            Utility LLMProvider instance
+
+        Raises:
+            ValueError: If provider not initialized
+        """
+        if self._utility_provider is None:
+            raise ValueError("Utility LLM provider not configured.")
+        return self._utility_provider
+
+    def get_synthesis_provider(self) -> LLMProvider:
+        """Get the synthesis LLM provider (for high-quality operations).
+
+        Returns:
+            Synthesis LLMProvider instance
+
+        Raises:
+            ValueError: If provider not initialized
+        """
+        if self._synthesis_provider is None:
+            raise ValueError("Synthesis LLM provider not configured.")
+        return self._synthesis_provider
+
+    def is_configured(self) -> bool:
+        """Check if both LLM providers are configured and available.
+
+        Returns:
+            True if both providers are configured
+        """
+        return (
+            self._utility_provider is not None and self._synthesis_provider is not None
+        )
+
+    def list_providers(self) -> list[str]:
+        """List available LLM providers.
+
+        Returns:
+            List of provider names
+        """
+        return list(
+            dict.fromkeys(
+                [*self._providers.keys(), *OPENAI_COMPATIBLE_PROVIDERS.keys()]
+            )
+        )
+
+    @classmethod
+    def register_provider(cls, name: str, provider_class: type[LLMProvider]) -> None:
+        """Register a new LLM provider.
+
+        Args:
+            name: Provider name
+            provider_class: Provider class
+        """
+        cls._providers[name] = provider_class
+        logger.debug(f"Registered LLM provider: {name}")
+
+    async def health_check(self) -> dict[str, Any]:
+        """Perform health check on both configured providers.
+
+        Returns:
+            Health check results for both providers
+        """
+        results = {}
+
+        if self._utility_provider:
+            results["utility"] = await self._utility_provider.health_check()
+        else:
+            results["utility"] = {
+                "status": "not_configured",
+                "message": "Utility provider not configured",
+            }
+
+        if self._synthesis_provider:
+            results["synthesis"] = await self._synthesis_provider.health_check()
+        else:
+            results["synthesis"] = {
+                "status": "not_configured",
+                "message": "Synthesis provider not configured",
+            }
+
+        return results
+
+    def get_usage_stats(self) -> dict[str, Any]:
+        """Get usage statistics from both configured providers.
+
+        Returns:
+            Usage statistics for both providers
+        """
+        stats = {}
+
+        if self._utility_provider:
+            stats["utility"] = self._utility_provider.get_usage_stats()
+
+        if self._synthesis_provider:
+            stats["synthesis"] = self._synthesis_provider.get_usage_stats()
+
+        return stats

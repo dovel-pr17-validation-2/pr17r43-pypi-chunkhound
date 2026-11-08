@@ -1,0 +1,475 @@
+"""New modular CLI entry point for ChunkHound."""
+
+import argparse
+import asyncio
+import logging as _pylogging
+import multiprocessing
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+from loguru import logger
+
+from chunkhound.core import analytics as ch_analytics
+from chunkhound.utils.windows_constants import IS_WINDOWS
+
+from .utils.config_factory import create_validated_config
+from .utils.rich_output import install_default_log_sink
+
+# Per-command action fields for analytics, mirroring the MCP hook's
+# _ANALYTICS_ACTION_FIELDS -- a small, meaningful subset of CLI args per
+# command, not a generic argument dump. "index" is intentionally absent:
+# its action fields (mode/file_count/total_chunks) aren't fully known
+# until the run completes, and are filled in via ch_analytics.update_action
+# from inside run_command() itself. Values here must match each subcommand
+# parser's actual argparse dest name -- "research"'s positional arg is
+# named `query` (see api/cli/parsers/research_parser.py), not `question`.
+_ANALYTICS_ACTION_ARGS: dict[str, tuple[str, ...]] = {
+    "search": ("query", "commit_range", "commit_hash", "last_n_commits"),
+    "research": ("query",),
+    "websearch": ("query",),
+    "fetchurl": ("url",),
+}
+
+# Bounded, single-shot commands analytics wraps -- excludes "mcp" (handled by
+# the MCP tool-call hook instead), "_daemon" (long-running, per the design's
+# non-goal for long-running commands), and "_quickresearch" (an internal
+# subprocess spawned by research/websearch, not a user-facing entry point).
+_ANALYTICS_WRAPPED_COMMANDS = frozenset(
+    {
+        "index",
+        "search",
+        "research",
+        "websearch",
+        "fetchurl",
+        "map",
+        "autodoc",
+        "calibrate",
+    }
+)
+
+
+def _analytics_action_fields(command: str, args: argparse.Namespace) -> dict:
+    fields = _ANALYTICS_ACTION_ARGS.get(command, ())
+    return {k: getattr(args, k) for k in fields if getattr(args, k, None) is not None}
+
+
+# Required for PyInstaller multiprocessing support
+multiprocessing.freeze_support()
+
+
+def _daemon_startup_breadcrumb(args: argparse.Namespace, message: str) -> None:
+    """Emit pre-server daemon startup breadcrumbs to the daemon stderr log."""
+    if getattr(args, "command", None) != "_daemon":
+        return
+    try:
+        timestamp = datetime.now().isoformat()
+        print(
+            f"[{timestamp}] [startup] startup: {message}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+def _install_logging_to_loguru_bridge(*, verbose: bool = False) -> None:
+    """Forward Python stdlib ``logging`` records into ``loguru``.
+
+    ``pyo3-log`` sends Rust ``log::info!`` / ``log::warn!`` into Python
+    ``logging`` at the corresponding level.  Since ChunkHound uses
+    ``loguru`` and not the stdlib logging module, those messages would
+    otherwise be silently discarded.
+
+    Installed once from ``setup_logging``, which runs after ``loguru``
+    but before any Rust pipeline work.
+    """
+    import logging as _logging
+    from types import FrameType
+
+    class _Bridge(_logging.Handler):
+        def emit(self, record: _logging.LogRecord) -> None:
+            # Preserve the record's real level — a Rust log::warn! must still
+            # display (and be greppable) as WARNING, distinct from routine
+            # log::info! progress lines. Visibility of Rust INFO lines
+            # without --verbose is handled by the sink filter in
+            # setup_logging(), not by relabeling the level here.
+            # loguru's logger.log() accepts either a registered level name
+            # (str) or a raw severity number (int) — the fallback below is
+            # for stdlib logging levels loguru has no registered name for.
+            level: str | int
+            try:
+                level = logger.level(record.levelname).name
+            except ValueError:
+                level = record.levelno
+
+            frame: FrameType | None = _logging.currentframe()
+            depth = 2
+            while frame is not None and frame.f_code.co_filename == _logging.__file__:
+                frame = frame.f_back
+                depth += 1
+
+            is_rust = record.name.startswith("chunkhound_native")
+            logger.bind(rust_native=is_rust).opt(
+                depth=depth, exception=record.exc_info
+            ).log(level, record.getMessage())
+
+    _bridge = _Bridge()
+    _bridge.setLevel(_logging.DEBUG if verbose else _logging.INFO)
+    # Remove the default StreamHandler that basicConfig installed — we
+    # forward everything through loguru instead.
+    _root = _logging.getLogger()
+    for h in list(_root.handlers):
+        _root.removeHandler(h)
+    _root.addHandler(_bridge)
+    # Lower the root-logger threshold so our handler sees INFO messages.
+    # ``basicConfig(level=ERROR)`` was already called above; this is
+    # deliberately run AFTER for correct ordering.
+    if _root.level > _bridge.level:
+        _root.setLevel(_bridge.level)
+
+    # Third-party HTTP libraries emit per-request trace spam: httpx's
+    # "HTTP Request: POST ..." at INFO, and httpcore._trace /
+    # openai._base_client (full request bodies) at DEBUG. Under --verbose the
+    # DEBUG stream floods the log and drowns ChunkHound's own output — most
+    # notably the Rust pipeline's per-batch timing lines. Silence them
+    # unconditionally; our own loggers (chunkhound.* and the Rust
+    # chunkhound_native.* timers) still emit at DEBUG when --verbose is set.
+    for _noisy_logger in ("httpx", "httpcore", "openai"):
+        _logging.getLogger(_noisy_logger).setLevel(_logging.WARNING)
+
+
+def setup_logging(verbose: bool = False) -> None:
+    """Configure logging for the CLI.
+
+    Args:
+        verbose: Whether to enable verbose logging
+    """
+    logger.remove()
+    # Shared with ProgressManager (rich_output.py) so progress-bar-scoped
+    # logging never diverges from this process's actual verbosity.
+    install_default_log_sink(verbose)
+    # Also set stdlib logging level to avoid mixed loggers being noisy
+    _pylogging.basicConfig(level=_pylogging.DEBUG if verbose else _pylogging.ERROR)
+
+    # ── Bridge Python stdlib logging → loguru ──────────────────────
+    # pyo3-log sends Rust log::info! / log::warn! into Python logging.
+    # Without this bridge those messages are silently discarded because
+    # ChunkHound uses loguru, not the stdlib logging module.
+    _install_logging_to_loguru_bridge(verbose=verbose)
+
+
+def create_parser() -> argparse.ArgumentParser:
+    """Create and configure the complete argument parser.
+
+    Returns:
+        Configured ArgumentParser instance
+    """
+    # Import parsers dynamically to avoid early loading
+    from .parsers import create_main_parser, setup_subparsers
+    from .parsers.autodoc_parser import add_autodoc_subparser
+    from .parsers.calibrate_parser import add_calibrate_subparser
+    from .parsers.code_mapper_parser import add_map_subparser
+    from .parsers.daemon_parser import add_daemon_subparser
+    from .parsers.fetchurl_parser import add_fetchurl_subparser
+    from .parsers.mcp_parser import add_mcp_subparser
+    from .parsers.quickresearch_parser import add_quickresearch_subparser
+    from .parsers.research_parser import add_research_subparser
+    from .parsers.run_parser import add_run_subparser
+    from .parsers.search_parser import add_search_subparser
+    from .parsers.websearch_parser import add_websearch_subparser
+
+    parser = create_main_parser()
+    subparsers = setup_subparsers(parser)
+
+    # Add command subparsers
+    add_run_subparser(subparsers)
+    add_mcp_subparser(subparsers)
+    add_search_subparser(subparsers)
+    add_websearch_subparser(subparsers)
+    add_fetchurl_subparser(subparsers)
+    add_research_subparser(subparsers)
+    add_autodoc_subparser(subparsers)
+    add_map_subparser(subparsers)
+    # Diagnose command retired; functionality lives under: index --check-ignores
+    add_calibrate_subparser(subparsers)
+    # Internal commands (hidden from help)
+    add_quickresearch_subparser(subparsers)
+    add_daemon_subparser(subparsers)
+
+    return parser
+
+
+async def async_main() -> None:
+    """Async main entry point for the CLI."""
+    parser = create_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    # Setup logging for non-MCP commands (MCP already handled above)
+    setup_logging(getattr(args, "verbose", False))
+
+    # Validate args and create config
+    # Special-case: index subtools (--simulate, --check-ignores) skip embeddings
+    if args.command == "index" and (
+        getattr(args, "simulate", False) or getattr(args, "check_ignores", False)
+    ):
+        setattr(args, "no_embeddings", True)
+
+    # For the internal _daemon command, map --project-dir to args.path so that
+    # Config.__init__ resolves the correct project root and config file.
+    if args.command == "_daemon" and hasattr(args, "project_dir"):
+        from pathlib import Path as _Path
+
+        args.path = _Path(args.project_dir).resolve()
+
+    # Suppress stray log lines that could corrupt MCP stdio framing. The
+    # `mcp` command sets this later at chunkhound/api/cli/commands/mcp.py, but
+    # the remote-config pipeline runs inside create_validated_config below —
+    # WARNINGs from that path must go through log_if_not_mcp, which needs
+    # CHUNKHOUND_MCP_MODE to be set already. mcp_server/stdio.py and
+    # mcp_server/http_server.py set the same var before their factory call.
+    if args.command == "mcp":
+        os.environ["CHUNKHOUND_MCP_MODE"] = "1"
+
+    _daemon_startup_breadcrumb(args, "startup tracking began mode=daemon")
+    config_validation_started = time.monotonic()
+    _daemon_startup_breadcrumb(args, "phase started: cli_config_validation")
+    config, validation_errors = await create_validated_config(args, args.command)
+    config_validation_duration = time.monotonic() - config_validation_started
+
+    if validation_errors:
+        joined_errors = "; ".join(validation_errors)
+        _daemon_startup_breadcrumb(
+            args,
+            "phase failed: cli_config_validation "
+            f"duration={config_validation_duration:.3f}s error={joined_errors}",
+        )
+        should_show_web_banner = sys.stderr.isatty()
+        logger.error("Configuration error — see details below.")
+        if should_show_web_banner:
+            print(
+                "\nConfiguration required. "
+                "Generate a config with the web configurator:\n"
+                "  https://chunkhound.ai\n"
+                "Or create .chunkhound.json manually.\n"
+                "Offline docs: https://chunkhound.ai/docs/configuration/\n",
+                file=sys.stderr,
+            )
+
+        # Check if this is an embedding-related error
+        embedding_error = any(
+            "embedding provider" in str(e).lower() for e in validation_errors
+        )
+
+        # Log all errors to stderr
+        for error in validation_errors:
+            logger.error(f"Error: {error}")
+
+        # Always emit the core hint so non-interactive environments see it.
+        print(
+            "Hint: Create a .chunkhound.json config file"
+            " — docs: https://chunkhound.ai/docs/configuration/",
+            file=sys.stderr,
+        )
+
+        # Show detailed steps only for interactive terminals.
+        if should_show_web_banner:
+            print("To fix this, you can:", file=sys.stderr)
+            print("  1. Generate a config at https://chunkhound.ai", file=sys.stderr)
+            print("  2. Create a .chunkhound.json file manually", file=sys.stderr)
+            print(
+                "  3. Read the config docs at https://chunkhound.ai/docs/configuration/",
+                file=sys.stderr,
+            )
+            if embedding_error and args.command == "index":
+                print("  4. Use --no-embeddings to skip embeddings", file=sys.stderr)
+
+        sys.exit(1)
+
+    _daemon_startup_breadcrumb(
+        args,
+        "phase completed: cli_config_validation "
+        f"duration={config_validation_duration:.3f}s",
+    )
+
+    # `mcp`/`_daemon` build and own their own recorder (one per server
+    # process, see mcp_server/base.py) -- constructing a second one here
+    # would spin up a redundant background flush thread + reqwest client
+    # for the lifetime of that long-running process. `_quickresearch` is an
+    # internal subprocess, not a user-facing entry point. Only build a
+    # recorder at all for commands this hook actually wraps.
+    if args.command in _ANALYTICS_WRAPPED_COMMANDS:
+        analytics_recorder = ch_analytics.build_recorder(
+            getattr(config, "analytics", None), config.target_dir or Path.cwd()
+        )
+        _save_sensitive_data = getattr(
+            getattr(config, "analytics", None), "save_sensitive_data", False
+        )
+        analytics_handle = ch_analytics.start_command(
+            analytics_recorder,
+            args.command,
+            "cli",
+            _analytics_action_fields(args.command, args),
+            _save_sensitive_data,
+        )
+    else:
+        analytics_recorder = None
+        analytics_handle = 0
+
+    try:
+        if args.command == "index":
+            # Dynamic import to avoid early chunkhound module loading
+            from .commands.run import run_command
+
+            await run_command(args, config)
+        elif args.command == "mcp":
+            # Dynamic import to avoid early chunkhound module loading
+            from .commands.mcp import mcp_command
+
+            await mcp_command(args, config)
+        elif args.command == "search":
+            # Dynamic import to avoid early chunkhound module loading
+            from .commands.search import search_command
+
+            await search_command(args, config)
+        elif args.command == "research":
+            # Dynamic import to avoid early chunkhound module loading
+            from .commands.research import research_command
+
+            await research_command(args, config)
+        elif args.command == "_quickresearch":
+            from .commands.quickresearch import quickresearch_command
+
+            await quickresearch_command(args, config)
+        elif args.command == "websearch":
+            from .commands.websearch import websearch_command
+
+            await websearch_command(args, config)
+        elif args.command == "fetchurl":
+            from .commands.fetchurl import fetchurl_command
+
+            await fetchurl_command(args, config)
+        elif args.command == "map":
+            # Dynamic import to avoid early chunkhound module loading
+            from .commands.code_mapper import code_mapper_command
+
+            await code_mapper_command(args, config)
+        elif args.command == "autodoc":
+            from .commands.autodoc import autodoc_command
+
+            await autodoc_command(args, config)
+        elif args.command == "calibrate":
+            # Dynamic import to avoid early chunkhound module loading
+            from .commands.calibrate import calibrate_command
+
+            await calibrate_command(args, config)
+        elif args.command == "_daemon":
+            # Internal: run the multi-client daemon process
+            from .commands.daemon import daemon_command
+
+            await daemon_command(args, config)
+        # 'diagnose' command retired; use: chunkhound index --check-ignores --vs git
+        else:
+            logger.error(f"Unknown command: {args.command}")
+            logger.info("Run 'chunkhound --help' for available commands.")
+            sys.exit(1)
+
+        ch_analytics.end_command(analytics_recorder, analytics_handle, True)
+
+    except KeyboardInterrupt:
+        # User-initiated, not a command failure -- deliberately not recorded
+        # as either a success or a failure in analytics.
+        logger.info("Interrupted by user")
+        sys.exit(0)
+    except SystemExit as e:
+        # Every wrapped command already does its own error handling and
+        # calls sys.exit() directly on failure (see e.g. commands/search.py,
+        # commands/code_mapper.py) -- SystemExit is a BaseException, not an
+        # Exception, so without this clause it would skip the `except
+        # Exception` branch below entirely and leave this command's handle
+        # open (and its event unrecorded) on every one of those paths.
+        #
+        # A 0/None code is treated the same as the KeyboardInterrupt case
+        # above rather than as success: the only such path today is
+        # commands/run.py's own internal KeyboardInterrupt handler, which
+        # exits 0 after an interrupted (not successful) indexing run --
+        # genuine command success never calls sys.exit() itself, it just
+        # returns and falls through to the `end_command(..., True)` call
+        # above. Any other code is a real command-level failure.
+        code = e.code
+        if code is None or (isinstance(code, int) and code == 0):
+            raise
+        ch_analytics.record_internal_error("SystemExit")
+        ch_analytics.end_command(analytics_recorder, analytics_handle, False)
+        raise
+    except Exception as e:
+        ch_analytics.record_internal_error(type(e).__name__)
+        ch_analytics.end_command(analytics_recorder, analytics_handle, False)
+        logger.error(f"Command failed: {e}")
+        logger.exception("Full error details:")
+        sys.exit(1)
+    finally:
+        # Best-effort final flush, bounded so a slow/unreachable S3 endpoint
+        # can never hang CLI exit. Runs on every path out of the try block
+        # above, including sys.exit() (finally still runs before SystemExit
+        # propagates) -- a hard kill (SIGKILL) skips this entirely and relies
+        # on the orphan sweep on a later run instead.
+        ch_analytics.shutdown(analytics_recorder)
+
+
+def main() -> None:
+    """Main entry point for the CLI."""
+    if IS_WINDOWS:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="backslashreplace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(errors="backslashreplace")
+    try:
+        asyncio.run(async_main())
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except ImportError as e:
+        # More specific handling for import errors
+        logger.error(f"Import error: {e}")
+        logger.info(
+            "This usually means a dependency is missing. "
+            "Try: uv tool install chunkhound"
+        )
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(1)
+    except Exception as e:
+        # Check if this is a Pydantic validation error for missing provider
+        error_str = str(e)
+        if (
+            "validation error for EmbeddingConfig" in error_str
+            and "provider" in error_str
+        ):
+            logger.error(
+                "Embedding provider must be specified. "
+                "Choose from: openai, voyageai, or use an OpenAI-compatible endpoint.\n"
+                "Set via --provider, CHUNKHOUND_EMBEDDING__PROVIDER environment "
+                "variable, or in config file."
+            )
+        else:
+            error_type = type(e).__name__
+            logger.error(f"Unexpected error ({error_type}): {e}")
+
+            # Add additional context for common terminal/Rich issues
+            if "color format" in str(e).lower() or "wrong color" in str(e).lower():
+                logger.error(
+                    "This appears to be a terminal compatibility issue. "
+                    "Try running with CHUNKHOUND_NO_RICH=1 environment variable."
+                )
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

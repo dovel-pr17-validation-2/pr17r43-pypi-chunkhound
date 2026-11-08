@@ -1,0 +1,607 @@
+"""DatabaseProvider protocol for ChunkHound - abstract interface for database implementations."""
+
+from pathlib import Path
+from typing import Any, Protocol
+
+from chunkhound.core.models import Chunk, Embedding, File
+
+
+class ScopeAggregationProvider(Protocol):
+    """Optional scope aggregation helpers (used by code_mapper coverage)."""
+
+    def get_scope_stats(self, scope_prefix: str | None) -> tuple[int, int]:
+        """Return (total_files, total_chunks) under an optional scope prefix.
+
+        Implementations should avoid loading full chunk code payloads.
+        """
+        ...
+
+    def get_scope_file_paths(self, scope_prefix: str | None) -> list[str]:
+        """Return file paths under an optional scope prefix.
+
+        Returned paths should be normalized to forward slashes and be comparable
+        to `metadata.sources.files` entries.
+        """
+        ...
+
+
+class DatabaseProvider(Protocol):
+    """Abstract protocol for database providers.
+
+    Defines the interface that all database implementations must follow.
+    This enables pluggable database backends (DuckDB, PostgreSQL, SQLite, etc.)
+    """
+
+    @property
+    def db_path(self) -> Path | str:
+        """Database connection path or identifier."""
+        ...
+
+    @property
+    def supports_rust_pipeline(self) -> bool:
+        """Whether this provider's backend can be driven by the Rust indexing
+        pipeline (chunkhound_native.IndexingPipeline), which only implements
+        a DuckDB backend.
+        """
+        ...
+
+    @property
+    def supports_embedding_sql_queries(self) -> bool:
+        """Whether targeted chunk/file/embedding SQL queries are supported."""
+        ...
+
+    def release_for_rust_pipeline(self) -> None:
+        """Release this provider's connection so the Rust pipeline can take
+        write ownership of the database file.
+
+        Only called when `supports_rust_pipeline` is True. Implementations
+        must leave themselves able to `connect()` again afterward, since the
+        coordinator always reconnects once the Rust pipeline finishes
+        (success or failure) so the process doesn't end up permanently
+        disconnected.
+
+        Raises:
+            DatabaseError: if the connection could not be closed.
+                Implementations must raise rather than swallow this — the
+                caller must not hand write ownership to the Rust pipeline
+                while Python's own connection to the same file may still be
+                open, or the database can be corrupted.
+        """
+        ...
+
+    def set_rust_pipeline_in_progress(self, active: bool) -> None:
+        """Publish whether the Rust pipeline currently owns write access to
+        the database file.
+
+        This is not set automatically as a side effect of
+        `release_for_rust_pipeline()` — callers must call this with `True`
+        only after that method returns successfully, and with `False` before
+        reconnecting once the Rust pipeline finishes. See
+        `chunkhound.services.rust_pipeline_runner.run_rust_indexing_phase()`
+        for the canonical (and currently sole) caller and the exact
+        set/clear boundaries.
+        """
+        ...
+
+    def is_rust_pipeline_in_progress(self) -> bool:
+        """Return True when the Rust pipeline currently owns write access to
+        the database file (see `set_rust_pipeline_in_progress`)."""
+        ...
+
+    def get_base_directory(self) -> Path:
+        """Get the base directory for path normalization.
+
+        Returns:
+            Path to the base directory used for resolving relative file paths.
+        """
+        ...
+
+    @property
+    def is_connected(self) -> bool:
+        """Check if database connection is active."""
+        ...
+
+    # Connection Management
+    def connect(self) -> None:
+        """Establish database connection and initialize schema."""
+        ...
+
+    def disconnect(self) -> None:
+        """Close database connection and cleanup resources."""
+        ...
+
+    # Schema Management
+    def create_schema(self) -> None:
+        """Create database schema for files, chunks, and embeddings."""
+        ...
+
+    def create_indexes(self) -> None:
+        """Create database indexes for performance optimization."""
+        ...
+
+    def create_vector_index(
+        self, provider: str, model: str, dims: int, metric: str = "cosine"
+    ) -> None:
+        """Create vector index for specific provider/model/dims combination."""
+        ...
+
+    def drop_vector_index(
+        self, provider: str, model: str, dims: int, metric: str = "cosine"
+    ) -> str:
+        """Drop vector index for specific provider/model/dims combination."""
+        ...
+
+    def drop_all_hnsw_indexes(self) -> None:
+        """Drop every HNSW index on all embedding tables.
+
+        No-op for providers without HNSW support (LanceDB).
+        """
+        ...
+
+    def ensure_all_hnsw_indexes(self) -> None:
+        """Ensure canonical HNSW indexes exist on all embedding tables.
+
+        No-op for providers without HNSW support (LanceDB).
+        """
+        ...
+
+    async def drop_all_hnsw_indexes_async(self) -> None:
+        """Drop provider-managed HNSW indexes without blocking the event loop."""
+        ...
+
+    async def ensure_all_hnsw_indexes_async(self) -> None:
+        """Rebuild provider-managed HNSW indexes without blocking the event loop."""
+        ...
+
+    # File Operations
+    def insert_file(self, file: File) -> int:
+        """Insert file record and return file ID."""
+        ...
+
+    def get_file_by_path(
+        self, path: str, as_model: bool = False
+    ) -> dict[str, Any] | File | None:
+        """Get file record by path."""
+        ...
+
+    def get_file_by_id(
+        self, file_id: int, as_model: bool = False
+    ) -> dict[str, Any] | File | None:
+        """Get file record by ID."""
+        ...
+
+    def update_file(self, file_id: int, **kwargs: Any) -> None:
+        """Update file record with new values."""
+        ...
+
+    def delete_file_completely(self, file_path: str) -> bool:
+        """Delete a file and all its chunks/embeddings completely."""
+        ...
+
+    def delete_files_batch(self, file_paths: list[str]) -> int:
+        """Delete multiple files and their chunks/embeddings completely."""
+        ...
+
+    async def delete_file_completely_async(self, file_path: str) -> bool:
+        """Delete a file and all its chunks/embeddings completely (asynchronous)."""
+        ...
+
+    async def delete_files_batch_async(self, file_paths: list[str]) -> int:
+        """Delete multiple files and their chunks/embeddings completely (asynchronous)."""
+        ...
+
+    async def insert_file_async(self, file: File) -> int:
+        """Insert file record and return file ID (asynchronous)."""
+        ...
+
+    async def get_file_by_path_async(
+        self, path: str, as_model: bool = False
+    ) -> dict[str, Any] | File | None:
+        """Get file record by path (asynchronous)."""
+        ...
+
+    async def update_file_async(self, file_id: int, **kwargs: Any) -> None:
+        """Update file record with new values (asynchronous)."""
+        ...
+
+    async def record_skipped_file_async(
+        self,
+        path: str,
+        name: str,
+        extension: str,
+        size: int,
+        mtime: float,
+        language: str | None,
+        content_hash: str | None,
+        skip_reason: str,
+    ) -> None:
+        """Upsert a file record with skip_reason to prevent re-scanning (asynchronous)."""
+        ...
+
+    # Chunk Operations
+    def insert_chunk(self, chunk: Chunk) -> int:
+        """Insert chunk record and return chunk ID."""
+        ...
+
+    def insert_chunks_batch(self, chunks: list[Chunk]) -> list[int]:
+        """Insert multiple chunks in batch and return chunk IDs."""
+        ...
+
+    def get_chunk_by_id(
+        self, chunk_id: int, as_model: bool = False
+    ) -> dict[str, Any] | Chunk | None:
+        """Get chunk record by ID."""
+        ...
+
+    def get_chunks_by_file_id(
+        self, file_id: int, as_model: bool = False
+    ) -> list[dict[str, Any] | Chunk]:
+        """Get all chunks for a specific file."""
+        ...
+
+    async def get_chunks_by_file_id_async(
+        self, file_id: int, as_model: bool = False
+    ) -> list[dict[str, Any] | Chunk]:
+        """Get all chunks for a specific file (asynchronous)."""
+        ...
+
+    async def insert_chunks_batch_async(self, chunks: list[Chunk]) -> list[int]:
+        """Insert multiple chunks in batch and return chunk IDs (asynchronous)."""
+        ...
+
+    async def delete_chunks_batch_async(self, chunk_ids: list[int]) -> None:
+        """Delete chunks by IDs (asynchronous)."""
+        ...
+
+    def delete_file_chunks(self, file_id: int) -> None:
+        """Delete all chunks for a file."""
+        ...
+
+    def delete_chunks_batch(self, chunk_ids: list[int]) -> None:
+        """Delete multiple chunks by IDs."""
+        ...
+
+    def delete_chunk(self, chunk_id: int) -> None:
+        """Delete a single chunk by ID."""
+        ...
+
+    def update_chunk(self, chunk_id: int, **kwargs: Any) -> None:
+        """Update chunk record with new values."""
+        ...
+
+    # Embedding Operations
+    def insert_embedding(self, embedding: Embedding) -> int:
+        """Insert embedding record and return embedding ID."""
+        ...
+
+    def insert_embeddings_batch(
+        self,
+        embeddings_data: list[dict],
+        batch_size: int | None = None,
+        connection: Any = None,
+    ) -> int:
+        """Insert multiple embedding vectors with optimization.
+
+        Args:
+            embeddings_data: List of embedding data dictionaries
+            batch_size: Optional batch size for database operations (uses provider default if None)
+            connection: Optional database connection to use (for transaction contexts)
+        """
+        ...
+
+    def get_embedding_by_chunk_id(
+        self, chunk_id: int, provider: str, model: str
+    ) -> Embedding | None:
+        """Get embedding for specific chunk, provider, and model."""
+        ...
+
+    def get_existing_embeddings(
+        self, chunk_ids: list[int], provider: str, model: str
+    ) -> set[int]:
+        """Get set of chunk IDs that already have embeddings for given provider/model."""
+        ...
+
+    def delete_embeddings_by_chunk_id(self, chunk_id: int) -> None:
+        """Delete all embeddings for a specific chunk."""
+        ...
+
+    def get_all_chunks_with_metadata(self) -> list[dict[str, Any]]:
+        """Get all chunks with their metadata including file paths (provider-agnostic)."""
+        ...
+
+    # Search Operations
+    def search_semantic(
+        self,
+        query_embedding: list[float],
+        provider: str,
+        model: str,
+        page_size: int = 10,
+        offset: int = 0,
+        threshold: float | None = None,
+        path_filter: str | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Perform semantic vector search.
+
+        Args:
+            query_embedding: Query embedding vector
+            provider: Embedding provider name
+            model: Embedding model name
+            page_size: Number of results per page
+            offset: Starting position for pagination
+            threshold: Optional similarity threshold
+            path_filter: Optional relative path to limit search scope (e.g., 'src/', 'tests/')
+
+        Returns:
+            Tuple of (results, pagination_metadata)
+        """
+        ...
+
+    def find_similar_chunks(
+        self,
+        chunk_id: int,
+        provider: str,
+        model: str,
+        limit: int = 10,
+        threshold: float | None = None,
+        path_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Find chunks similar to the given chunk using its embedding.
+
+        Args:
+            chunk_id: ID of the chunk to find similar chunks for
+            provider: Embedding provider name
+            model: Embedding model name
+            limit: Maximum number of results to return
+            threshold: Optional similarity threshold
+            path_filter: Optional relative path to limit search scope
+
+        Returns:
+            List of similar chunks with scores and metadata
+        """
+        ...
+
+    def search_by_embedding(
+        self,
+        query_embedding: list[float],
+        provider: str,
+        model: str,
+        limit: int = 10,
+        threshold: float | None = None,
+        path_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Find chunks similar to the given embedding vector.
+
+        Args:
+            query_embedding: The embedding vector to search with
+            provider: Embedding provider name
+            model: Embedding model name
+            limit: Maximum number of results to return
+            threshold: Optional similarity threshold
+            path_filter: Optional relative path to limit search scope
+
+        Returns:
+            List of similar chunks with scores and metadata
+        """
+        ...
+
+    def search_regex(
+        self,
+        pattern: str,
+        page_size: int = 10,
+        offset: int = 0,
+        path_filter: str | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Perform regex search on code content.
+
+        Args:
+            pattern: Regular expression pattern to search for
+            page_size: Number of results per page
+            offset: Starting position for pagination
+            path_filter: Optional relative path to limit search scope (e.g., 'src/', 'tests/')
+
+        Returns:
+            Tuple of (results, pagination_metadata)
+        """
+        ...
+
+    async def search_regex_async(
+        self,
+        pattern: str,
+        page_size: int = 10,
+        offset: int = 0,
+        path_filter: str | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Perform regex search on code content (asynchronous)."""
+        ...
+
+    async def get_chunk_similarities_async(
+        self,
+        chunk_ids: list[int],
+        query_embedding: list[float],
+        provider: str,
+        model: str,
+    ) -> dict[int, float]:
+        """Batch cosine similarity between a query embedding and stored chunk embeddings.
+
+        Returns:
+            Dict mapping chunk_id to cosine similarity score (0.0 for missing embeddings).
+        """
+        ...
+
+    def list_file_paths_under_directory(self, directory_prefix: str) -> list[str]:
+        """Return every ``files.path`` under a relative directory prefix.
+
+        Includes paths equal to ``directory_prefix`` and paths starting with
+        ``f"{directory_prefix}/"``. Used by realtime deleted-directory cleanup
+        so chunkless rows (binary, empty, or unparseable files) are still
+        enumerated alongside chunked rows.
+        """
+        ...
+
+    def search_text(
+        self, query: str, page_size: int = 10, offset: int = 0
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Perform full-text search on code content.
+
+        Returns:
+            Tuple of (results, pagination_metadata)
+        """
+        ...
+
+    def get_chunks_in_range(
+        self, file_id: int, start_line: int, end_line: int
+    ) -> list[dict[str, Any]]:
+        """Get chunks overlapping a line range within a file.
+
+        Used for window expansion in research to find neighboring context.
+
+        Args:
+            file_id: ID of the file to search within
+            start_line: Start of line range (1-indexed)
+            end_line: End of line range (1-indexed)
+
+        Returns:
+            List of chunk dictionaries overlapping the range
+        """
+        ...
+
+    # Statistics and Monitoring
+    def get_stats(self) -> dict[str, int]:
+        """Get database statistics (file count, chunk count, etc.)."""
+        ...
+
+    async def get_stats_async(self) -> dict[str, int]:
+        """Get database statistics (asynchronous)."""
+        ...
+
+    def get_file_stats(self, file_id: int) -> dict[str, Any]:
+        """Get statistics for a specific file."""
+        ...
+
+    def get_provider_stats(self, provider: str, model: str) -> dict[str, Any]:
+        """Get statistics for a specific embedding provider/model."""
+        ...
+
+    def get_embedding_model_counts(self) -> list[dict[str, Any]]:
+        """Summarize stored vectors by provider, model and dimensions.
+
+        Returns one row per combination with ``provider``, ``model``,
+        ``dims``, ``count`` and ``latest``: the newest vector's write time as
+        a datetime or POSIX timestamp, or None when the backend records none.
+        """
+        ...
+
+    # Transaction and Bulk Operations
+    def execute_query(
+        self, query: str, params: list[Any] | None = None
+    ) -> list[dict[str, Any]]:
+        """Execute a SQL query and return results."""
+        ...
+
+    def begin_transaction(self) -> None:
+        """Begin a database transaction."""
+        ...
+
+    def commit_transaction(self, force_checkpoint: bool = False) -> None:
+        """Commit the current transaction."""
+        ...
+
+    def rollback_transaction(self) -> None:
+        """Rollback the current transaction."""
+        ...
+
+    async def begin_transaction_async(self) -> None:
+        """Begin a database transaction (asynchronous)."""
+        ...
+
+    async def commit_transaction_async(self, force_checkpoint: bool = False) -> None:
+        """Commit the current transaction (asynchronous)."""
+        ...
+
+    async def rollback_transaction_async(self) -> None:
+        """Rollback the current transaction (asynchronous)."""
+        ...
+
+    # File Processing Integration
+    async def process_file(
+        self, file_path: Path, skip_embeddings: bool = False
+    ) -> dict[str, Any]:
+        """Process a file end-to-end: parse, chunk, and store in database."""
+        ...
+
+    async def process_directory(
+        self,
+        directory: Path,
+        patterns: list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Process all supported files in a directory."""
+        ...
+
+    # Compaction / Fragmentation
+    def compact_database(self) -> int:
+        """Compact the database file to eliminate fragmentation.
+
+        Provider-specific implementation. DuckDB rebuilds a fresh canonical
+        ChunkHound database file, then atomically swaps it into place. Unknown
+        / non-canonical tables may be dropped by provider design.
+
+        Returns:
+            Size of the compacted database in bytes. Returns 0 for in-memory.
+        """
+        ...
+
+    async def compact_database_async(self) -> int:
+        """Compact the database file (asynchronous).
+
+        Returns:
+            Size of the compacted database in bytes.
+        """
+        ...
+
+    def measure_fragmentation(self) -> float:
+        """Return fragmentation ratio. Fully stateless.
+
+        Uses PRAGMA database_size, pragma_storage_info (block allocation
+        metadata), and os.path.getsize to compare actual file size against
+        the estimated minimum live data size.
+        < 1.5 = healthy, > 3.0 = fragmented, > 5.0 = significantly fragmented.
+        """
+        ...
+
+    def compact_if_needed(self) -> bool:
+        """Compact the database if fragmentation exceeds threshold.
+
+        Fully stateless: measures fragmentation via PRAGMA database_size + file stat.
+        Returns True if compaction was performed.
+        """
+        ...
+
+    async def compact_if_needed_async(self) -> bool:
+        """Async variant of compact_if_needed."""
+        ...
+
+    # Health and Diagnostics
+    def optimize_tables(self) -> None:
+        """Optimize tables with provider-specific maintenance work."""
+        ...
+
+    def should_optimize(self, operation: str = "") -> bool:
+        """Check if optimization is warranted.
+
+        Args:
+            operation: Optional operation context (e.g., "post-chunking", "post-indexing")
+
+        Returns:
+            True if optimization should run, False to skip.
+            Default False assumes database self-manages optimization.
+        """
+        ...
+
+    def health_check(self) -> dict[str, Any]:
+        """Perform health check and return status information."""
+        ...
+
+    def get_connection_info(self) -> dict[str, Any]:
+        """Get information about the database connection."""
+        ...

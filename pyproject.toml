@@ -1,0 +1,285 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs", "packaging>=21.0", "zstandard>=0.23.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chunkhound"
+dynamic = ["version"]
+description = "Local-first codebase intelligence for AI assistants via MCP"
+readme = "README.md"
+keywords = [
+    "code search",
+    "semantic search",
+    "MCP",
+    "AI agents",
+    "CAST algorithm",
+    "vector search",
+]
+requires-python = ">=3.10,<3.15"
+authors = [
+    {name = "Ofri Wolfus"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Processing :: Indexing",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Environment :: Console",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "duckdb==1.5.4",
+    "openai>=1.0.0",
+    "jsonschema>=4.0.0",
+    "packaging>=21.0",
+    "aiohttp>=3.12.15",
+    "rapidyaml>=0.11.0",
+    "tree-sitter>=0.25.0",
+    "tree-sitter-python>=0.25.0",
+    "tree-sitter-markdown>=0.5.1",
+    "tree-sitter-language-pack>=0.7.3,<1.0.0",
+    "pydantic>=2.12.0",
+    "pydantic-settings>=2.0.0",
+    "loguru>=0.6.0",
+    # The MCP server uses the SDK 1.x low-level decorator API. MCP 2.x
+    # replaced it with constructor callbacks, so do not resolve an
+    # incompatible SDK until the server is migrated.
+    "mcp>=1.16.0,<2",
+    # Declared directly (not just pulled in transitively via mcp) because
+    # chunkhound/mcp_server/http_server.py imports their APIs directly.
+    # This adds no install weight beyond mcp's own requirements: mcp>=1.16.0
+    # already depends unconditionally on starlette>=0.27 and uvicorn>=0.31.1
+    # (no extras gating), so every chunkhound install — stdio-only or not —
+    # gets them anyway. Making these "optional" here would not save anyone
+    # an install; it would just let our own version floors drift from what
+    # mcp actually needs.
+    "starlette>=0.48.0",
+    "uvicorn>=0.37.0",
+    "psutil>=5.8.0",
+    "PyYAML>=6.0.0",
+    "tiktoken>=0.9.0",
+    "tree-sitter-groovy>=0.1.2",
+    "tree-sitter-kotlin>=1.1.0",
+    "tree-sitter-elixir>=0.3.4",
+    "tree-sitter-lua>=0.4.0",
+    "tree-sitter-make>=0.1.0",
+    "watchdog>=4.0.0",
+    "xxhash>=3.0.0",
+    "tree-sitter-bash>=0.25.0",
+    "tree-sitter-c>=0.24.1",
+    "tree-sitter-c-sharp>=0.23.1",
+    "tree-sitter-cpp>=0.23.4",
+    "tree-sitter-java>=0.23.5",
+    "tree-sitter-javascript>=0.25.0",
+    "tree-sitter-typescript>=0.23.2",
+    "tree-sitter-go>=0.25.0",
+    "tree-sitter-haskell>=0.23.1",
+    "tree-sitter-rust>=0.24.0",
+    "tree-sitter-zig>=1.1.0",
+    "tree-sitter-json>=0.24.8",
+    "tree-sitter-php>=0.24.0",
+    "tree-sitter-sql>=0.3.0",
+    "tree-sitter-toml>=0.7.0",
+    "lancedb>=0.25.3",
+    "pandas>=2.3.0",
+    "pylance>=0.31.0",
+    # pyarrow<24.0.0 due to Windows CI Access Violation (fatal exception)
+    # when importing pyarrow.dataset via lancedb (see win-3.14-CI.txt).
+    # This crash occurs on GitHub Windows runners (both 3.12 and 3.14)
+    # with pyarrow 24.x + lancedb 0.25.x due to native DLL conflicts.
+    # PyArrow 23.x is the last known stable range with LanceDB on Windows CI.
+    "pyarrow>=23.0.0,<24.0.0",
+    "voyageai>=0.2.0",
+    "httpx>=0.28.1",
+    "pymupdf>=1.27.0",
+    "rich>=13.0.0",
+    "readchar>=4.2.1",
+    "scikit-learn>=1.3.0",
+    "scipy>=1.7.0",
+    "numpy>=1.24.0",
+    "pathspec>=0.12.1",
+    "pygit2>=1.12.0",
+    "google-genai>=1.51.0",
+    "anthropic>=0.96.0,<1.0.0",
+    "msgpack>=1.0",
+    "zstandard>=0.23.0",
+    "tomli>=2.0.0; python_version < '3.11'",
+    "tree-sitter-html>=0.23.2",
+    "tree-sitter-css>=0.25.0",
+    "lark>=1.1.0",
+    "markdownify>=1.0",
+    # Exact pin: chunkhound/utils/websearch_core.py:_fetch_page couples to
+    # zendriver 0.15.3's CDP binding and sync-dispatch internals (see the
+    # connection.py:826/830 references in that file, plus the Chrome >=124
+    # Response.charset workaround). Bumping requires re-validating the
+    # response-event race ordering and the async-handler dispatch path.
+    "zendriver==0.15.3",
+    "chunkhound-native>=5.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-timeout>=2.1.0",
+    "pytest-rerunfailures>=13.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.6.0",
+]
+test = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-timeout>=2.1.0",
+    "pytest-rerunfailures>=13.0",
+]
+
+[project.scripts]
+chunkhound = "chunkhound.api.cli.main:main"
+chunkhound-mcp = "chunkhound.mcp_server.stdio:main_sync"
+
+[project.urls]
+Homepage = "https://github.com/chunkhound/chunkhound"
+Repository = "https://github.com/chunkhound/chunkhound"
+Issues = "https://github.com/chunkhound/chunkhound/issues"
+Documentation = "https://chunkhound.ai"
+Changelog = "https://github.com/chunkhound/chunkhound/releases"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "chunkhound/_version.py"
+
+[tool.hatch.build]
+include = [
+    "chunkhound/**/*.py",
+    "chunkhound/py.typed",
+    "chunkhound/code_mapper/prompts/*.md",
+    "chunkhound/autodoc/prompts/*.txt",
+    "chunkhound/autodoc/assets/**/*",
+    "chunkhound/watchman_runtime/README.md",
+    "chunkhound/watchman_runtime/platforms/*/manifest.json",
+    "tests/fixtures/yaml/**/*",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["chunkhound"]
+exclude = [
+    "chunkhound/watchman_runtime/platforms/**/*",
+]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+[tool.chunkhound.watchman_runtime]
+package = "chunkhound.watchman_runtime"
+requires_platform_wheel = true
+wheel_tag_must_not_be = "any"
+supported_platforms = [
+    "linux-x86_64",
+    "windows-x86_64",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "N",  # pep8-naming
+    "UP", # pyupgrade
+]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# Tool descriptions are LLM-facing strings — wrapping them breaks formatting
+"chunkhound/mcp_server/tools.py" = ["E501"]
+# Prompt templates are LLM-facing strings — wrapping them breaks formatting
+"chunkhound/services/prompts/fetchurl.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+timeout = 300
+addopts = [
+    "--verbose",
+    "--tb=short",
+    "--strict-markers",
+    # pytest-xdist's default "load" scheduler ignores the xdist_group marker
+    # entirely -- only "loadgroup" honors it, co-locating same-group tests on
+    # one worker. Several tests rely on this (see native_ext_fs_mutation in
+    # tests/contracts/) to avoid racing each other's real filesystem mutation
+    # under `-n auto`. No-op for ungrouped tests and for runs without -n.
+    "--dist=loadgroup",
+]
+filterwarnings = [
+    # Suppress SWIG-related warnings from tree-sitter bindings
+    "ignore:builtin type.*has no __module__ attribute:DeprecationWarning",
+    # Suppress asyncio subprocess/pipe transport cleanup warnings in tests.
+    # On Windows, _ProactorBasePipeTransport raises during GC if pipes are
+    # not explicitly closed before the event loop shuts down.
+    "ignore:Exception ignored in.*BaseSubprocessTransport:pytest.PytestUnraisableExceptionWarning",
+    "ignore:Exception ignored in.*ProactorBasePipeTransport:pytest.PytestUnraisableExceptionWarning",
+    "ignore:Exception ignored in.*PipeTransport:pytest.PytestUnraisableExceptionWarning",
+    # Allow other warnings to be displayed
+]
+markers = [
+    "asyncio: marks tests as asyncio-based; local event_loop fixture handles loop",
+    "fast: marks tests as fast and deterministic (inverse of slow)",
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.15.0",
+    "mypy>=1.16.0",
+    "nuitka>=2.7.7",
+    "pyinstaller>=6.14.1",
+    "pytest>=8.4.0",
+    "pytest-asyncio>=1.0.0",
+    "pytest-rerunfailures>=13.0",
+    "pytest-split>=0.9.0",
+    "pytest-timeout>=2.1.0",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.11.12",
+    "types-psutil>=7.0.0.20250601",
+    "types-jsonschema>=4.0.0",
+]

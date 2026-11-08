@@ -1,0 +1,166 @@
+"""Database factory module - creates services with proper dependency injection.
+
+This module eliminates circular dependencies by serving as a dedicated composition root
+for service creation. Clean internal architecture with external compatibility.
+
+UNIFIED SERVICE CREATION PATTERN:
+1. Use create_services() for clean internal architecture
+2. Legacy create_database_with_dependencies() maintained for compatibility
+3. Registry configuration happens automatically through this factory
+
+BEHAVIOR GUARANTEE:
+This factory ensures consistent component injection across all execution paths:
+- CLI commands get same component setup as MCP servers
+- All services have proper dependency injection
+- Registry configuration is applied uniformly
+
+INTEGRATION REQUIREMENT:
+Any changes to this factory must be tested across all execution paths:
+- CLI commands (chunkhound run)
+- MCP stdio server
+- File change processing
+"""
+
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, NamedTuple
+
+from loguru import logger
+
+from chunkhound.embeddings import EmbeddingManager
+from chunkhound.registry import configure_registry, get_registry
+
+if TYPE_CHECKING:
+    from chunkhound.database import Database
+    from chunkhound.interfaces.database_provider import DatabaseProvider
+    from chunkhound.services.diff_aware_search_service import SearchServiceProtocol
+    from chunkhound.services.embedding_service import EmbeddingService
+    from chunkhound.services.indexing_coordinator import IndexingCoordinator
+
+
+class DatabaseServices(NamedTuple):
+    """Clean service bundle for modern internal architecture."""
+
+    provider: "DatabaseProvider"
+    indexing_coordinator: "IndexingCoordinator"
+    search_service: "SearchServiceProtocol"
+    embedding_service: "EmbeddingService"
+
+
+def _db_root_path_for_config(
+    db_path: Path | str, *, provider: str | None
+) -> Path | str:
+    """Return the directory-style database path expected by DatabaseConfig.
+
+    `DatabaseConfig.get_db_path()` derives provider-specific locations from the
+    configured `database.path` root. Some call sites pass canonical provider
+    paths (e.g. `.../chunks.db` or `.../lancedb.lancedb`) into `create_services`.
+    When we feed those canonical paths back into a `Config`, we must convert
+    them back to the root so `get_db_path()` stays stable.
+    """
+    if str(db_path) == ":memory:":
+        return db_path
+
+    path = Path(db_path)
+
+    if provider == "duckdb":
+        if path.name == "chunks.db":
+            return path.parent
+        return path
+
+    if provider == "lancedb":
+        if path.suffix == ".lancedb":
+            return path.parent
+        return path
+
+    if path.name == "chunks.db":
+        return path.parent
+    if path.suffix == ".lancedb":
+        return path.parent
+    return path
+
+
+def create_services(
+    db_path: Path | str,
+    config: dict[str, Any] | Any,
+    embedding_manager: EmbeddingManager | None = None,
+) -> DatabaseServices:
+    """Create clean service bundle for modern internal architecture.
+
+    Args:
+        db_path: Path to database file
+        config: Registry configuration (dict or Config object)
+        embedding_manager: Optional embedding manager
+
+    Returns:
+        DatabaseServices bundle with all components
+    """
+    registry = get_registry()
+
+    # Always (re)configure the registry with an effective per-call config so that
+    # tests using distinct temporary directories get an IndexingCoordinator whose
+    # base_directory matches the current tmp_path. This avoids cross-test leakage
+    # from the global registry's previous target_dir.
+    effective_config: dict[str, Any] | Any = config
+    try:
+        if isinstance(config, dict):
+            effective_config = dict(config)
+            db_dict = dict(effective_config.get("database", {}))
+            db_dict.setdefault("provider", "duckdb")
+            db_dict["path"] = _db_root_path_for_config(
+                db_path, provider=str(db_dict.get("provider") or "duckdb")
+            )
+            effective_config["database"] = db_dict
+        else:
+            if hasattr(config, "database") and hasattr(config.database, "path"):
+                provider = getattr(config.database, "provider", None)
+                config.database.path = Path(
+                    _db_root_path_for_config(
+                        db_path, provider=str(provider or "duckdb")
+                    )
+                )
+            effective_config = config
+    except Exception as exc:
+        logger.debug(f"Config path normalization failed, using raw config: {exc}")
+        effective_config = config
+
+    configure_registry(effective_config)
+
+    # If embedding_manager is provided, register its provider with the global registry
+    # so services use the same instance, held to the index like the registry's own
+    if embedding_manager:
+        try:
+            provider = embedding_manager.get_default_provider()
+            if provider:
+                registry.register_embedding_provider(provider)
+        except Exception as exc:
+            logger.opt(exception=True).warning("Provider registration failed: {}", exc)
+
+    return DatabaseServices(
+        provider=registry.get_provider("database"),
+        indexing_coordinator=registry.create_indexing_coordinator(),
+        search_service=registry.create_search_service(),
+        embedding_service=registry.create_embedding_service(),
+    )
+
+
+def create_database_with_dependencies(
+    db_path: Path | str,
+    config: dict[str, Any],
+    embedding_manager: EmbeddingManager | None = None,
+) -> "Database":
+    """Legacy wrapper - use create_services() for clean internal architecture.
+
+    Maintained for external compatibility only.
+    """
+    from chunkhound.database import Database
+
+    services = create_services(db_path, config, embedding_manager)
+
+    return Database(
+        db_path=db_path,
+        embedding_manager=embedding_manager,
+        indexing_coordinator=services.indexing_coordinator,
+        search_service=services.search_service,
+        embedding_service=services.embedding_service,
+        provider=services.provider,
+    )
